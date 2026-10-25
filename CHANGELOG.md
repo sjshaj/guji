@@ -86,6 +86,9 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
   生产 dry-run 分片 0（234 原始 → 61 条，0 失败，预算 11/50）
 - 5 队列就位，guji-digest 队列级 `delivery_delay=90` 未受部署影响；
   4 个 cron 表达式（6 触发点）在线
+- GitHub 推送走 REST API 通道（git 协议不通）；中途一次中文路径
+  quotepath 转义事故（幻影文件 + 文档错位）已用 fast-forward 修正提交
+  修复，全量字节级验证 26 文件一致（DEVLOG §4.6.6）
 - **新 digest 路径未手动触发**（会砍掉 05:50 定时班 fresh 窗口，DEVLOG §4.6.5），
   留给 05:40-06:00 无人值守首班自然验收
 
