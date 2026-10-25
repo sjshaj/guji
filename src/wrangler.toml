@@ -1,0 +1,80 @@
+name = "guji"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+# 复用现有 KV（guji-free-kv），不新建
+[[kv_namespaces]]
+binding = "GUJI_KV"
+id = "ca49d41ac8fa4987a0f818cee47237bf"
+
+# Workers AI：每日精选的中文总结（先精选后总结，不做全文翻译）
+[ai]
+binding = "AI"
+
+# ---------------- 队列（2026-02-04 起免费套餐可用）----------------
+# v4 架构：cron 只入队，消费者干活。每个消费者调用享有独立的 50 子请求预算，
+# 彻底消除 v3「单次调用 47/50 走钢丝、余量为 0」的问题。
+#   抓取分片队列：4 条消息（39 源 ÷ 10），消费者每次 1 条 ≈ 13/50
+#   精选队列：1 条消息，消费者 ≈ 19/50
+#   推送队列：3 条顺序分片消息，每片 ≈ 29/50（最坏，含单条 3 次重试）
+#   死信队列：重试耗尽的消息在此落地，消费者负责记日志（不静默丢失）
+[[queues.producers]]
+binding = "GUJI_FETCH_Q"
+queue = "guji-fetch"
+
+# 精选队列生产者：90 秒延迟投递——给抓取消费者留出就位时间。
+#   cron 路径：:50 入队 → :51:30 前后消费，距 :00 推送班仍有 8 分钟缓冲；
+#   手动 /api/build 路径：抓取与精选同时入队，延迟保证分片先就绪（双保险，
+#   消费者内还有 ≤45s 轮采等待 + 预算护栏，见 index.js §13.2）。
+# ⚠️ 字段名是 snake_case delivery_delay（秒）。曾误写为 camelCase deliveryDelay，
+#    wrangler  silently 忽略（部署日志有 Unexpected fields 警告），队列实际 delay=0。
+[[queues.producers]]
+binding = "GUJI_DIGEST_Q"
+queue = "guji-digest"
+delivery_delay = 90
+
+[[queues.producers]]
+binding = "GUJI_SEND_Q"
+queue = "guji-send"
+
+# 抓取消费者：每批 1 条消息（= 1 个分片），4 片可并行（分片键按 window+序号隔离，无共享写）
+[[queues.consumers]]
+queue = "guji-fetch"
+max_batch_size = 1
+max_concurrency = 4
+max_retries = 3
+dead_letter_queue = "guji-dlq"
+
+# 精选消费者：单条串行；重试次数给足（退避正好充当「等抓取班完成」的等待）
+[[queues.consumers]]
+queue = "guji-digest"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 10
+dead_letter_queue = "guji-dlq"
+
+# 推送消费者：单条串行（保序：报头→精选条目，私聊→频道）
+[[queues.consumers]]
+queue = "guji-send"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 3
+dead_letter_queue = "guji-dlq"
+
+# 死信消费者：只记日志
+[[queues.consumers]]
+queue = "guji-dlq"
+max_batch_size = 10
+
+# 每天三班 × 两个时段（列表语法：40,50 = 每小时第 40、50 分各触发一次）：
+#   40 分 → 抓取班：入队 4 条分片消息（消费者抓取 + 落分片 KV）
+#   50 分 → 精选班：入队 1 条精选消息（消费者读分片 → enrich → AI → 落 latest）
+#   00 分 → 推送班：入队 3 条推送消息（消费者读 latest → 顺序分片限速推送）
+# UTC：21:40/21:50 = 北京 05:40/05:50 早班；22:00 = 北京 06:00 早报推送
+#      13:40/13:50 = 北京 21:40/21:50 晚班；14:00 = 北京 22:00 晚报推送
+[triggers]
+crons = ["40,50 21 * * *", "0 22 * * *", "40,50 13 * * *", "0 14 * * *"]
+
+# 可选：Telegram 推送（不配就只是网站）
+# npx wrangler secret put TG_BOT_TOKEN
+# npx wrangler secret put TG_CHAT_ID
