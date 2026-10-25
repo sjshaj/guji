@@ -1485,6 +1485,18 @@ async function consumeSend(batch, env) {
   }
 
   // v4.0.1（外部审查 A1）：失败项分流——瞬时失败入补推队列，永久错误放弃并留痕
+  //
+  // 【设计决策：为什么不用 msg.retry()】Cloudflare Queues 的 msg.retry() 是
+  // **消息级**粒度：一条 guji-send 消息 = 一个分片（约 6-9 条推送），若其中
+  // 5 条成功、4 条瞬时失败，retry 整条会把**已成功的 5 条也重推**——用户收到
+  // 重复日报。正确解法是把失败项单独组装成新消息入 guji-retry 补推队列：
+  //   - 只含失败项（按 i 从 chunk 回取 text），重推的永远是失败项本身；
+  //   - 消息级重试天然幂等（重推失败项 ≠ 重推成功项）；
+  //   - attempts 轮计数（≤RETRY_MAX_ROUNDS=3）由消息体携带，轮间重新入队，
+  //     不依赖队列级 max_retries（那只能兜「消费过程抛错」）。
+  // 永久错误（chat not found / 被拉黑 / 用户注销 / 无权发言）重推无意义，
+  // 按 isPermanentTgError 识别后 ack 放弃，但写 run:{window}:send:{slice}:failed
+  // 留痕——失败绝不静默（DEVLOG 坑 7 教训）。
   const failed = results.filter(r => !r.ok);
   if (failed.length) {
     const retriable = failed.filter(r => !isPermanentTgError(r.err));
