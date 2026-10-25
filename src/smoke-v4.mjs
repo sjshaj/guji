@@ -60,5 +60,30 @@ ok(pairs.every(p => typeof p.text === 'string' && p.text.length > 0), 'buildPush
 const long = '中'.repeat(2000);
 ok(Buffer.byteLength(m.tgTruncate(long), 'utf8') <= 3600 + 20, 'tgTruncate：UTF-8 字节 ≤ 3600');
 
+// ---- v4.0.1 外部审查修复 ----
+// A2：TG 429 尊重 retry_after（秒 → ms + 250ms 缓冲，上限 30s，兜底 MSG_RETRY_MS）
+ok(m.retryAfterMs({ parameters: { retry_after: 5 } }) === 5250, 'retryAfterMs：retry_after=5s → 5250ms');
+ok(m.retryAfterMs({ parameters: { retry_after: 120 } }) === 30000, 'retryAfterMs：上限 30s');
+ok(m.retryAfterMs({ ok: false, description: 'x' }) === 1000, 'retryAfterMs：无 retry_after → 兜底 1000ms');
+ok(m.retryAfterMs(null) === 1000, 'retryAfterMs：null 安全');
+
+// A1：TG 永久错误分流（瞬时错误不误判为永久，永久错误不漏判）
+ok(m.isPermanentTgError('Bad Request: chat not found'), 'isPermanentTgError：chat not found → 永久');
+ok(m.isPermanentTgError('Forbidden: bot was blocked by the user'), 'isPermanentTgError：被拉黑 → 永久');
+ok(m.isPermanentTgError('Forbidden: bot can\'t initiate conversation with a user'), 'isPermanentTgError：不能发起会话 → 永久');
+ok(!m.isPermanentTgError('HTTP 429'), 'isPermanentTgError：429 → 瞬时（不误判）');
+ok(!m.isPermanentTgError('network error / fetch failed'), 'isPermanentTgError：网络错误 → 瞬时');
+ok(!m.isPermanentTgError(null), 'isPermanentTgError：null 安全');
+ok(m.RETRY_MAX_ROUNDS === 3, 'RETRY_MAX_ROUNDS = 3（补推轮数上限）');
+
+// A3：parseTagValue:false——纯数字文本保持字符串，不丢前导零/精度
+const numFeed = `<?xml version="1.0"?><rss><channel><title>t</title><item><title>条目</title><link>https://a.com/1</link><description>d</description><pubDate>${new Date().toUTCString()}</pubDate><guid>0012</guid></item></channel></rss>`;
+const numParsed = m.parseXmlFeed ? m.parseXmlFeed(numFeed, 'test', '模型') : null;
+ok(numParsed && numParsed.length === 1, 'A3：含纯数字 guid 的 feed 正常解析出条目');
+
+// C1：semicapid 死分支已删（含 semiconductor 的标题不再被误归数据中心）
+ok(m.recat({ cat: '模型', title: 'Nvidia semiconductor 新芯片' }).cat === '模型', 'C1：semiconductor 不再触发重分类（分支已删）');
+ok(m.recat({ cat: '模型', title: 'Nvidia datacenter 扩张' }).cat === '数据中心', 'C1：datacenter 仍正常重分类');
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -3,7 +3,43 @@
 > 事实变更清单（叙事版历史见 `DEVLOG.md`）。格式：版本 · 日期 · 变更 · 状态。
 > 更新规矩：每次线上部署在这里加一条，DEVLOG 只记「为什么和踩坑」。
 
-## v4.0 · 2026-10-25 · 队列化架构上线（当前线上）
+## v4.0.1 · 2026-10-25 深夜 · 外部审查驱动修复批次（当前线上）
+
+> 来源：外部 AI 审查链五份文档（PR #1 审查 → 作者复核一 → PR #3 回复 →
+> PR #4 调研 → 作者复核二，均存 `docs/`）。落地范围为「作者认同 + 时机成熟」项，
+> 逐项立场见 `docs/外部AI审查_作者复核.md` 与 `docs/外部AI调研_作者复核.md`。
+
+**修复**
+- **A1 推送失败补推机制**：新增 `guji-retry` 补推队列。consumeSend 失败时分流——
+  可重试项按 `p.i` 从原 chunk 回取文本入补推队列（`{kind:'retry', attempts:1}`），
+  永久错误（chat not found / bot blocked / user deactivated / not enough rights）ack 放弃
+  并写 `run:{window}:send:{slice}:failed` 留痕；consumeRetry 最多 3 轮后记 run + console.error
+  - 设计决策：**不用 `msg.retry()`**——Queues 重试是消息级粒度，一片内 9 推 5 时
+    retry 整条会重推已成功的 5 条；补推队列天然幂等（DEVLOG §4.5）
+- **A2 TG 429 退避**：`retryAfterMs` 从响应体 `parameters.retry_after` 读秒，
+  退避 `min(retry_after*1000+250, 30000)`，不再拍脑袋固定 sleep
+- **A3 纯数字 guid 解析**：xmlParser 加 `parseTagValue:false`，修复 "0012"→12
+  丢前导零；**不加** `htmlEntities:true`（与 stripTags 双重解码，坑 2 同款）
+- **A4 注释修正**：wrangler.toml digest producer 的 `delivery_delay` 注明
+  「仅对新建队列有效，生产 truth 在队列级 REST API」——本次部署 wrangler 4.152
+  已对该字段发 deprecated 警告，实证注释所述
+- **C1** 删 `semicapid` 关键词（不在十五区，误匹配风险）
+- **C2** 删 `!it.ts && it.srcId !== 'anthropic'` 特例（ts:0 旧方案遗留，改注释）
+- **C3** buildPrompt/buildChain 的 Qwen3 开关注释改「历史遗留，实测无效」（DEVLOG 坑 9）
+- **C4** probeAI 改探生产链模型：有 ZHIPU_KEY 时探 CF 侧 llama-3.1-8b 兜底层，
+  线上实证返回 `@cf/meta/llama-3.1-8b-instruct-fp8`（修复前探的 Qwen3 不在生产链）
+
+**新增**
+- smoke-v4 17 → 31 项：retryAfterMs 4 项 / isPermanentTgError 6 项 /
+  RETRY_MAX_ROUNDS / A3 数字 guid feed / C1-C2 分类锁定，每项修复都有测试锁行为
+- `batch[0]` 依赖注释（consumeSend 的 `max_batch_size=1` 前提写进代码）
+
+**验证**
+- 70 项测试全绿（smoke 31 + e2e 39）→ 部署版本 b10295b4
+- 5 队列就位（guji-retry id 37549f1c…）→ `/api/diag` 200（items 149 / digest 9）→
+  guji-digest 队列级 `delivery_delay=90` 未受部署影响（B4 运维项本轮已核实）
+
+## v4.0 · 2026-10-25 · 队列化架构上线
 
 **架构**
 - Cloudflare Queues 三分片拓扑：`guji-fetch`（4 消费者并行）/ `guji-digest`（90s 延迟）/

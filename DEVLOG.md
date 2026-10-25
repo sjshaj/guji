@@ -538,6 +538,69 @@ const mark = (stage, extra = {}) => net.kvPut(
 
 ---
 
+### 4.5 v4.0.1：外部审查驱动的修复批次（10-25 深夜）
+
+#### 4.5.1 要解决什么
+
+首班验收满分后，把外部审查链（五份文档：PR #1 审查 → 作者复核一 →
+PR #3 回复 → PR #4 调研 → 作者复核二）里「作者认同 + 时机成熟」的项落地。
+纪律：**验收不换代码**（验收手册按 0482501 版制定），验收结束后立即启动修复——
+首班实际零推送失败，A1 的真实样本没等到，但机制必须待命。
+
+#### 4.5.2 设计决策：A1 为什么是「补推队列」而不是 `msg.retry()`
+
+这是本批次唯一真正的架构决策，值得完整记录：
+
+1. **平台语义先于方案**：Cloudflare Queues 的 `msg.retry()` 是**消息级**粒度。
+   consumeSend 里一条消息 = 一个分片（约 6-9 条推送），若其中 5 条成功、
+   4 条瞬时失败，retry 整条消息会把**已成功的 5 条重推**——用户收到重复日报
+2. **方案**：失败分流。可重试项按 `p.i` 从原 chunk 回取文本，组装
+   `{kind:'retry', window, slice, attempts:1, pairs:[{i,text}...]}` 入**新队列
+   guji-retry**；永久错误（TG_PERMANENT_ERR：chat not found / bot was blocked /
+   user is deactivated / not enough rights）ack 放弃 + console.error + 写
+   `run:{window}:send:{slice}:failed` 留痕。consumeRetry 最多 3 轮
+   （RETRY_MAX_ROUNDS），耗尽同样留痕后 ack
+3. **为什么幂等是天然的**：补推消息只含失败项，消息级重试重推的仍是失败项本身，
+   不会碰已成功项。队列语义与业务正确性在这里对上了
+4. **外部审查原本建议的「retry」如果照做会引入重复推送 bug**——这就是
+   「新眼睛看不到实现暗礁」的实证，也是审查链必须配作者复核的原因
+
+其余修复相对直接，各有一条值得记：
+
+- **A2 retry_after**：TG 429 响应体带 `parameters.retry_after`（秒），
+  `retryAfterMs = min(retry_after*1000+250, 30000)`——**服务端告诉你等多久，
+  就别猜**。上限 30s 防恶意值卡死消费者
+- **A3 parseTagValue:false**：fast-xml-parser v5 默认把纯数字文本转 number，
+  guid 0012 → 12（前导零丢失，拼 URL 出错）。**不能顺手加
+  `htmlEntities:true`**——stripTags 已解过一次实体，双重解码会把
+  `&amp;amp;` 变成 `&`（坑 2 同款错误换个位置复发）
+- **A4 部署实证**：wrangler 4.152 对 producer 段 `delivery_delay` 发
+  deprecated 警告「has no effect」——注释修正与平台警告互相印证，
+  生产 truth 仍在队列级 REST API（部署后核实 delay=90 无恙）
+- **C4 线上实证**：修复后 `/api/diag` 的 aiProbe 返回
+  `@cf/meta/llama-3.1-8b-instruct-fp8`——有 ZHIPU_KEY 时探的是生产链
+  CF 侧兜底层，修复前探的 Qwen3 根本不在链上，探针等于自欺
+
+#### 4.5.3 测试体系随修复扩展
+
+smoke-v4 17 → 31 项：retryAfterMs 4 项（含 30s 上限与 null 安全）、
+isPermanentTgError 6 项（429 不误判为永久是重点）、RETRY_MAX_ROUNDS、
+A3 数字 guid feed 解析、C1/C2 分类锁定。纪律不变：**每项修复都有测试锁行为，
+改前改后全绿**（本批 70 项 = smoke 31 + e2e 39）
+
+#### 4.5.4 反思（v4.0.1）
+
+1. **审查链五文件制的运作实证**：外部 AI 提供新眼睛（意图漂移、原则未贯彻），
+   作者复核提供实现暗礁（消息级重试粒度、htmlEntities 双重解码）。
+   两者缺一不可——只有前者会引入新 bug，只有后者会惯性失灵
+2. **「消息级重试」是平台语义盲区**：用队列三年的人也可能默认 retry 是
+   条目级。凡是「平台替我做 X」的假设，落方案前先读官方文档的粒度定义
+3. **修复也要分批次、定时机**：正确性 + 删减（批次 1，半天）→ 效率（批次 2）
+   → 重构（批次 3）。把「改核心路径的项」（如 C6 rubric 化）排在 fixture
+   测试之后，不拿线上质量换改进速度
+
+---
+
 ## 5. 横切反思：贯穿四版的方法论
 
 ### 5.1 用户教我的事（按时间）
@@ -567,7 +630,7 @@ const mark = (stage, extra = {}) => net.kvPut(
 ### 5.3 给接手 AI 的快速建议
 
 1. 先读 `docs/GUJI-代码重构交接.md` §1-§2——不理解 50 子请求预算模型就别动抓取/推送
-2. 任何改动先跑 `node src/smoke-v4.mjs && node src/e2e-v4.mjs`（56 项）
+2. 任何改动先跑 `node src/smoke-v4.mjs && node src/e2e-v4.mjs`（70 项）
 3. 部署后验证三连：`/api/diag` + 页面分类计数 + 推送结果
 4. 密钥全部 `wrangler secret put`，**代码和 wrangler.toml 不许出现 token**
 5. 「功能没生效」先查 KV run 记录（`guji:v4:run:{window}:*`）——埋点会告诉你死在哪步
@@ -578,7 +641,7 @@ const mark = (stage, extra = {}) => net.kvPut(
 
 ## 6. 版本代码存档对照
 
-本仓库只保留 v4 线上版（`src/index.js`）。历史版本的下落与还原方式：
+本仓库只保留 v4 系列线上版（`src/index.js`，当前 v4.0.1）。历史版本的下落与还原方式：
 
 | 版本 | 下落 | 还原方式 |
 |---|---|---|
@@ -586,7 +649,8 @@ const mark = (stage, extra = {}) => net.kvPut(
 | v3 原版（~1200 行） | 被重构版覆盖 | 本文 §3.2 |
 | v3 重构版（885 行） | 开发机留有 `index.js.bak-20251025-1042` | §3.2（6）所述变化 |
 | v3→v4 中间态（1647 行） | 开发机留有 `index.js.bak-20251025-v3refactor-pre-queues` | 含早期 queue 区，埋点未加 |
-| **v4（1699 行）** | **本仓库 `src/index.js` = 线上运行版** | — |
+| **v4.0（1699 行）** | git commit `0482501`（= 外部审查对象，首班验收运行版） | `git show 0482501:src/index.js` |
+| **v4.0.1（1825 行）** | **本仓库 `src/index.js` = 线上运行版**（A1 补推队列等 9 项修复，§4.5） | — |
 
 > 若要把某个历史版本也归档进仓库，从开发机拷贝对应 `.bak` 到
 > `docs/archive/` 并在此表更新位置——**不要改文件名里的日期**，那是时间证据。

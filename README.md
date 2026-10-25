@@ -76,7 +76,7 @@ npx wrangler secret put TG_BOT_TOKEN     # Telegram bot token（推送）
 npx wrangler secret put TG_CHAT_ID       # Telegram 私聊 chat id（推送目标）
 
 # 4. 本地冒烟 + 端到端测试（mock 全部外部依赖，不需要密钥和网络）
-node src/smoke-v4.mjs   # 17 项
+node src/smoke-v4.mjs   # 31 项
 node src/e2e-v4.mjs     # 39 项
 
 # 5. 本地 dev（可选，注意沙箱限制见下）
@@ -94,7 +94,7 @@ cd src && npx wrangler deploy
   `https://guji.dpdns.org`
 - 沙箱里 Node fetch 有波动（偶发 000/502），同一测试跑三遍再下结论
 - 测试文件不需要 secret/网络：mock 了 KV/队列/AI/fetch，
-  改完逻辑先跑它们（56 项）再部署
+  改完逻辑先跑它们（70 项）再部署
 - **怎么加测试**：照 `smoke-v4.mjs` 的 `ok(cond, name)` 模式追加即可；
   纯函数（parsers/tgTruncate/分片键/预算记账）进 smoke，跨模块链路进 e2e
 
@@ -124,10 +124,10 @@ guji/
 │   ├── 故障排查Runbook.md       # 症状 → 查什么 → 常见根因（含紧急恢复）
 │   └── archive/                 # 历史快照（源清单副本、未引用资源，只作存档）
 └── src/
-    ├── index.js                 # 全部线上代码（1699 行，按 §1-§15 区分区）
+    ├── index.js                 # 全部线上代码（1825 行，按 §1-§15 区分区）
     ├── wrangler.toml            # Worker + KV + Queues + cron 配置（注释即文档）
     ├── package.json
-    ├── smoke-v4.mjs             # 17 项冒烟测试（mock KV/队列/AI/fetch）
+    ├── smoke-v4.mjs             # 31 项冒烟测试（mock KV/队列/AI/fetch）
     └── e2e-v4.mjs               # 39 项端到端测试
 ```
 
@@ -155,12 +155,12 @@ guji/
 ## 当前状态与已知限制
 
 - **已验证**：39 源 → ~160 条/班、精选 ~12 条、双班推送正常、延迟投递 t0+104s、
-  全链路测试 56 项通过
+  全链路测试 70 项通过
 - **已知取舍/开放项**（详见 `ROADMAP.md`）：
   - digest 消费者同 window 内二次 build 会读到上轮分片（低频操作，已记录）
   - `/api/diag` 诊断端点无鉴权
   - 「分片消费者成批消失」事件根因未定位（沙箱 wrangler tail 不可用），已加埋点观测
-  - 单文件 1699 行，物理拆模块在计划中
+  - 单文件 1825 行，物理拆模块在计划中
 
 ## 安全须知
 

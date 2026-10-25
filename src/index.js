@@ -57,6 +57,7 @@ const SEEN_SET_KEY = 'guji:v4:seen';   // 跨调用去重集合（Anthropic slug
 const Q_FETCH = 'guji-fetch';   // 抓取分片（4 条消息 × 10 源）
 const Q_DIGEST = 'guji-digest'; // 精选编制（1 条消息）
 const Q_SEND = 'guji-send';     // 限速推送（3 条顺序分片消息）
+const Q_RETRY = 'guji-retry';   // 推送补推（失败项带 attempts 重入，见 §13.5；v4.0.1 新增）
 const Q_DLQ = 'guji-dlq';       // 死信（重试耗尽落地，消费者只记日志）
 
 // ---------------- 分片参数 ----------------
@@ -268,12 +269,17 @@ export function currentWindow(tsMs = Date.now()) {
 
 // RSS/Atom/RDF 统一解析器（fast-xml-parser v5：原生处理 CDATA、实体、属性）
 // 模块级单例：无内部状态，可安全复用（避免每条 feed 重复构造）
+// parseTagValue:false——v4.0.1 修复（外部审查 A3）：默认开启会把纯数字文本转 number
+//   （"0012"→12），EDGAR CIK/编号类字段有中招风险。不要加 htmlEntities:true——
+//   stripTags 已做实体解码，双重解码会把 &amp;lt; 过度解成 <。
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
   textNodeName: '#text',
   isArray: (name) => ['item', 'entry', 'category'].includes(name),
   processEntities: true,
+  parseTagValue: false,
+  trimValues: true,
 });
 
 const pickText = (node) => {
@@ -661,7 +667,8 @@ export async function fetchAnthropic(source, net) {
 
 // ---------------- 分类微调 ----------------
 // 模型类里提到数据中心/能源/代工的，归到数据中心（避免「芯片算力」吃掉一切）
-const DC_KW = /datacenter|data center|data-centre|energy|power grid|foundry|gigawatt|nuclear|reactor|grid|utility|utilities|semicapid/i;
+// （v4.0.1：删掉 semicaid——semiconductor 的错别字死分支，永远不命中；如未来要收再显式加）
+const DC_KW = /datacenter|data center|data-centre|energy|power grid|foundry|gigawatt|nuclear|reactor|grid|utility|utilities/i;
 function recat(item) {
   if (item.cat === '模型' && DC_KW.test(item.title)) item.cat = '数据中心';
   return item;
@@ -709,8 +716,9 @@ export function finalizeItems(all) {
     const maxAge = MAX_AGE[win] || MAX_AGE['72h'];
     // ① 超出时间窗口的丢弃（ts 为 0 表示无日期，不在此处判死）
     if (it.ts && nowSecValue - toSec(it.ts) > maxAge) continue;
-    // ② 无日期的只有 anthropic 源放行（按「新出现」算）
-    if (!it.ts && it.srcId !== 'anthropic') continue;
+    // ② 无日期的一律判死（anthropic 源不在此列——fetchAnthropic 已设 ts=抓取时刻，
+    //    「无日期只有 anthropic 放行」的特例是 v3 ts:0 方案的遗留，v4.0.1 删除）
+    if (!it.ts) continue;
     // ③ filter:1 的源只保留 AI 相关
     if (it.filter && !isAI(it)) continue;
     kept.push(recat(it));
@@ -892,10 +900,10 @@ async function fetchViaToMarkdown(url, net) {
 
 /**
  * 构建精选提示词。
- * 开头的 <arg_key:opensource> 是 Qwen3 的「软开关」：关闭思考模式。
- * ⚠️ 历史坑：不关的话，推理模型会把 max_tokens 全耗在 reasoning 上，
- *    返回空 content（曾导致精选恒为 0 条）。
- * 结尾 /no_think 是双重保险。
+ * ⚠️ 历史遗留（DEVLOG 坑 9）：开头的 <arg_key:opensource> 与结尾 /no_think 曾被当作
+ *    Qwen3 关思考的「开关」，实测三重全失效（Qwen3 会把 max_tokens 耗在 reasoning 上，
+ *    返回空 content，曾导致精选恒为 0 条）。最终解是换 GLM-4-plus（无思考模式）。
+ *    两个参数对 GLM 无害故保留，但**不再宣称有效**——v4.0.1 注释修正（外部审查 C3）。
  */
 export function buildPrompt(material) {
   const list = material.map((it, i) =>
@@ -954,7 +962,9 @@ export async function fetchViaZhipu(prompt, net) {
  * @param {string} prompt
  */
 export function buildChain(net, prompt) {
-  // chat_template_kwargs.enable_thinking=false 是 Qwen3 关思考的「正开关」（GLM 侧忽略此参数）
+  // ⚠️ 历史遗留（DEVLOG 坑 9）：chat_template_kwargs.enable_thinking=false 曾被当作
+  //    Qwen3 关思考的「正开关」，实测无效（Qwen3 空 content 的真正解是换 GLM-4-plus）。
+  //    参数对 GLM 无害故保留——v4.0.1 注释修正（外部审查 C3）。
   const cfPayload = {
     messages: [{ role: 'user', content: prompt }], max_tokens: 3072, temperature: 0.3,
     chat_template_kwargs: { enable_thinking: false },
@@ -1076,17 +1086,38 @@ export function buildPushPairs(env, data) {
 /** 消息间隔（同一聊天限速 ~1 条/秒，13 条连发会触发 429） */
 const MSG_GAP_MS = 300;
 
-/** 单条消息重试间隔（TG 瞬时 429/5xx） */
+/** 单条消息重试间隔（TG 瞬时 429/5xx；有 retry_after 时以它为准，见 retryAfterMs） */
 const MSG_RETRY_MS = 1000;
 
 /** 单条消息最多尝试次数 */
 const MSG_MAX_ATTEMPTS = 3;
 
+/** 补推队列最大轮数（每轮内 sendChunk 已有 3 次尝试，轮间重新入队） */
+const RETRY_MAX_ROUNDS = 3;
+
+/**
+ * TG 429 退避时长：优先尊重响应体 parameters.retry_after（秒，TG Bot API 规范字段），
+ * 提前重试会被更狠限流；兜底 MSG_RETRY_MS；硬上限 30s（外部审查 A2 修复）。
+ */
+function retryAfterMs(j2) {
+  const ra = j2 && j2.parameters && Number(j2.parameters.retry_after);
+  if (Number.isFinite(ra) && ra > 0) return Math.min(ra * 1000 + 250, 30000);
+  return MSG_RETRY_MS;
+}
+
+/**
+ * TG 永久性错误（重推无意义，应 ack 不重试）：
+ * chat 不存在 / 被 bot 拉黑 / 用户注销 / 无权发言等。
+ * 与瞬时错误（网络/5xx/限流）分流是补推机制的前提（外部审查 A1）。
+ */
+const TG_PERMANENT_ERR = /chat not found|bot was blocked|bot can't initiate|user is deactivated|chat_id is empty|group chat was upgraded|not enough rights|PEER_ID_INVALID/i;
+const isPermanentTgError = (err) => TG_PERMANENT_ERR.test(String(err || ''));
+
 /**
  * 发送一个推送分片（串行 + 片内限速 + 单条至多 3 次尝试）。
  * @param {object} net   createNet() 出口
  * @param {Array}  chunk buildPushPairs() 的有序子集
- * @returns {Promise<object[]>} 每条消息的推送结果
+ * @returns {Promise<object[]>} 每条消息的推送结果（含 chat/i/ok/msgId/err）
  */
 async function sendChunk(net, chunk) {
   const token = net.env.TG_BOT_TOKEN;
@@ -1104,7 +1135,7 @@ async function sendChunk(net, chunk) {
         if (j2.ok) { ok = true; msgId = j2.result && j2.result.message_id; }
         else {
           err = j2.description || ('HTTP ' + r.status);
-          if (attempt < MSG_MAX_ATTEMPTS) await sleep(MSG_RETRY_MS);
+          if (attempt < MSG_MAX_ATTEMPTS) await sleep(retryAfterMs(j2));
         }
       } catch (e) {
         err = String(e && e.message || e);
@@ -1291,6 +1322,9 @@ async function consumeFetch(batch, env) {
  *     每次重试都有全新预算与 45s 等待——生产者绑定另有 90s deliveryDelay 双保险）
  *   - items 为空 → 不碰 latest（保留上一班数据，页面不空屏），throw 重试
  *   - 精选彻底失败 → 仍落库（digest=[]，推送走英文清单兜底）→ 记 run → throw 重试
+ *
+ * ⚠️ 依赖 wrangler.toml 的 max_batch_size=1：本消费者只处理 batch.messages[0]
+ *    （v4.0.1：外部审查指出代码与配置存在隐性耦合，在此显式声明）。
  */
 async function consumeDigest(batch, env) {
   const budget = createBudget();
@@ -1399,6 +1433,13 @@ async function consumeDigest(batch, env) {
  *
  * 幂等：slice 0 完成后写 run:{window}:push，/api/push 路由据此防重复入队；
  * 数据新鲜度闸门继承 v3（3 小时），force 可 bypass（手动补推旧内容）。
+ *
+ * ⚠️ 依赖 wrangler.toml 的 max_batch_size=1：本消费者只处理 batch.messages[0]
+ *    （v4.0.1：外部审查指出代码与配置存在隐性耦合，在此显式声明）。
+ *
+ * v4.0.1（外部审查 A1 修复）：单条 3 次尝试失败不再无条件 ack——瞬时失败项
+ * 入 guji-retry 补推队列（带 attempts 轮计数），永久错误（chat not found 等）
+ * ack 不重推。修复前失败消息永久退出队列，只能等下一班。
  */
 async function consumeSend(batch, env) {
   const budget = createBudget();
@@ -1442,11 +1483,89 @@ async function consumeSend(batch, env) {
     await net.kvPut(runKey(window, 'push'), JSON.stringify({ at: Date.now(), ok: okCount, total: results.length }),
       { expirationTtl: 2 * 86400 }, 'run:push').catch(() => {});
   }
+
+  // v4.0.1（外部审查 A1）：失败项分流——瞬时失败入补推队列，永久错误放弃并留痕
+  const failed = results.filter(r => !r.ok);
+  if (failed.length) {
+    const retriable = failed.filter(r => !isPermanentTgError(r.err));
+    const permanent = failed.length - retriable.length;
+    if (retriable.length) {
+      // 失败项按 i（全局消息序号）从 chunk 回取 text，只补推失败的，不重推已成功的
+      const retryPairs = retriable.map(r => {
+        const src = chunk.find(p => p.i === r.i);
+        return { chat: r.chat, i: r.i, text: src ? src.text : '' };
+      }).filter(p => p.text);
+      if (retryPairs.length) {
+        await net.qSend(env.GUJI_RETRY_Q,
+          { kind: 'retry', window, slice, attempts: 1, pairs: retryPairs },
+          `retry:${slice}:${retryPairs.length}条`);
+        console.error(`[send] ${window} 分片${slice}：${retryPairs.length} 条瞬时失败，已入补推队列`);
+      }
+    }
+    if (permanent) {
+      console.error(`[send] ${window} 分片${slice}：${permanent} 条永久错误（${failed.filter(r => isPermanentTgError(r.err)).map(r => r.err).join('; ').slice(0, 120)}），放弃重推`);
+    }
+    await net.kvPut(runKey(window, `send:${slice}:failed`), JSON.stringify({
+      at: Date.now(), slice, retried: retriable.length, permanent,
+      errors: failed.map(r => ({ i: r.i, chat: r.chat, err: String(r.err).slice(0, 120) }))
+    }), { expirationTtl: 2 * 86400 }, `run:send-fail:${slice}`).catch(() => {});
+  }
   msg.ack();
   console.error(`[send] ${window} 分片${slice}：${okCount}/${results.length} 成功，预算 ${budget.total}/${budget.limit}`);
 }
 
-// ---------------- 13.4 死信消费者 ----------------
+// ---------------- 13.4 推送补推消费者（v4.0.1 新增） ----------------
+
+/**
+ * guji-retry 消费者：消费 guji-send 分流来的失败项（外部审查 A1 修复的方案 2）。
+ * 每条消息 = { window, slice, attempts, pairs:[{chat,i,text}] }，只含瞬时失败项。
+ *
+ * 语义：
+ *   - 重推成功 → ack（at-least-once：极端情况下首次超时误判会重复推送，日报可接受）
+ *   - 仍有瞬时失败且 attempts < RETRY_MAX_ROUNDS → attempts+1 重新入队（消息级重试天然幂等）
+ *   - 达到轮数上限 → 记 run + console.error 后 ack（失败绝不静默，但不无限循环）
+ *   - 全是永久错误 → ack（sendChunk 已按 isPermanentTgError 在上游分流过，双保险）
+ *
+ * ⚠️ 同样依赖 max_batch_size=1，只处理 batch.messages[0]。
+ */
+async function consumeRetry(batch, env) {
+  const budget = createBudget();
+  const net = createNet(env, budget);
+  const msg = batch.messages[0];
+  const { window, slice = 0, attempts = 1, pairs } = msg.body || {};
+  if (!pairs || !pairs.length) { msg.ack(); return; }
+
+  const results = await sendChunk(net, pairs);
+  const okCount = results.filter(r => r.ok).length;
+  const failed = results.filter(r => !r.ok);
+  const retriable = failed.filter(r => !isPermanentTgError(r.err));
+  await net.kvPut(runKey(window, `retry:${slice}`), JSON.stringify({
+    at: Date.now(), slice, attempts, ok: okCount, total: results.length, budget: budget.report()
+  }), { expirationTtl: 2 * 86400 }, `run:retry:${slice}`).catch(() => {});
+
+  if (!retriable.length) {
+    if (failed.length) console.error(`[retry] ${window} 分片${slice} 第${attempts}轮：${failed.length} 条永久错误，放弃`);
+    msg.ack();
+    return;
+  }
+  if (attempts >= RETRY_MAX_ROUNDS) {
+    console.error(`[retry] ${window} 分片${slice} 第${attempts}轮仍失败 ${retriable.length} 条（${retriable.map(r => r.err).join('; ').slice(0, 150)}），达到轮数上限，放弃（run KV 已留痕）`);
+    msg.ack();
+    return;
+  }
+  const nextPairs = retriable.map(r => {
+    const src = pairs.find(p => p.i === r.i);
+    return { chat: r.chat, i: r.i, text: src ? src.text : '' };
+  }).filter(p => p.text);
+  if (!nextPairs.length) { msg.ack(); return; }
+  await net.qSend(env.GUJI_RETRY_Q,
+    { kind: 'retry', window, slice, attempts: attempts + 1, pairs: nextPairs },
+    `retry:${slice}:r${attempts + 1}`);
+  console.error(`[retry] ${window} 分片${slice} 第${attempts}轮：${nextPairs.length} 条仍失败，入第 ${attempts + 1} 轮`);
+  msg.ack();
+}
+
+// ---------------- 13.5 死信消费者 ----------------
 
 /**
  * guji-dlq 消费者：重试耗尽的消息在此落地。只记日志（不静默丢失），
@@ -1465,17 +1584,23 @@ async function consumeDlq(batch, env) {
 
 // ---------------- 诊断辅助 ----------------
 
-/** 实时探测 AI 绑定是否可用（排查「精选 0 条」） */
+/**
+ * 实时探测 AI 绑定是否可用（排查「精选 0 条」）。
+ * v4.0.1（外部审查 C4 修复）：原探测 AI_MODELS[0]（qwen3）——有 ZHIPU_KEY 时
+ * 生产链是 [GLM, llama]，qwen3 永不参与生产，探测的是死模型。改为探测
+ * **CF 侧进生产链的模型**：有 key 时是 llama（AI_MODELS[1]），无 key 时是 qwen3。
+ */
 async function probeAI(net) {
   try {
     const t0 = Date.now();
-    const res = await net.aiRun(AI_MODELS[0], {
+    const m = net.env.ZHIPU_KEY ? AI_MODELS[1] : AI_MODELS[0];
+    const res = await net.aiRun(m, {
       messages: [{ role: 'user', content: '只回复两个字：正常' }], max_tokens: 64,
       chat_template_kwargs: { enable_thinking: false }
     }, 'diag:ai');
-    return { ok: true, ms: Date.now() - t0, text: aiText(res).slice(0, 40) };
+    return { ok: true, ms: Date.now() - t0, text: aiText(res).slice(0, 40), model: m };
   } catch (e) {
-    return { ok: false, err: String(e && e.message).slice(0, 200) };
+    return { ok: false, err: String(e && e.message).slice(0, 200), model: net.env.ZHIPU_KEY ? AI_MODELS[1] : AI_MODELS[0] };
   }
 }
 
@@ -1577,6 +1702,7 @@ export default {
       if (q === Q_FETCH) await consumeFetch(batch, env);
       else if (q === Q_DIGEST) await consumeDigest(batch, env);
       else if (q === Q_SEND) await consumeSend(batch, env);
+      else if (q === Q_RETRY) await consumeRetry(batch, env);
       else if (q === Q_DLQ) await consumeDlq(batch, env);
       else for (const m of batch.messages) m.ack(); // 未知队列：确认消费，不阻塞
     } catch (e) {
@@ -1678,7 +1804,7 @@ export default {
 export {
   // §1 config
   KV_KEY, SEEN_SET_KEY,
-  Q_FETCH, Q_DIGEST, Q_SEND, Q_DLQ,
+  Q_FETCH, Q_DIGEST, Q_SEND, Q_RETRY, Q_DLQ,
   SHARD_SIZE, SHARD_COUNT, SEND_SLICES, SHARD_WAIT_MS, SHARD_POLL_MS, shardKey, runKey,
   ENRICH_MAX, HTML_MAX, MAX_AGE,
   AI_KW, isAI, FEEDS,
@@ -1695,5 +1821,5 @@ export {
   // §10 digest
   MATERIAL_MAX,
   // §11 telegram
-  CAT_ICON, MSG_GAP_MS, MSG_MAX_ATTEMPTS,
+  CAT_ICON, MSG_GAP_MS, MSG_MAX_ATTEMPTS, RETRY_MAX_ROUNDS, isPermanentTgError, retryAfterMs,
 };
