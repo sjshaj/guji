@@ -39,6 +39,56 @@
 - 5 队列就位（guji-retry id 37549f1c…）→ `/api/diag` 200（items 149 / digest 9）→
   guji-digest 队列级 `delivery_delay=90` 未受部署影响（B4 运维项本轮已核实）
 
+## v4.0.2 · 2026-10-26 凌晨 · 精选环节五项改进 + 审查链收尾（当前线上）
+
+> 来源：外部调研 PR #4 精选专项（作者立场见 `docs/外部AI调研_作者复核.md`）+
+> 外部审查 PR #1 剩余认同项（B2/C5/C6/D2，立场见 `docs/外部AI审查_作者复核.md`）。
+> 叙事与踩坑见 DEVLOG §4.6。
+
+**精选（§10 核心路径）**
+- **P0-④ temperature 0.3→0.1**（`DIGEST_TEMPERATURE`）：低温降编造，
+  只求稳不宣称收益
+- **P0-② 提示词硬约束清单**：产品名/数字/版本号原文可找、宁省略不补全、
+  相对时间照抄、不强化语气、排他性表述仅原文明示才保留
+- **P0-③ 代码级忠实度校验**（`checkFaithful`/`filterFaithful`）：数字单位归一化
+  （35亿 = $3.5 billion = 3.5e9）、型号模式抽取（GPT-5/H100 规范化）、
+  **有意收窄**（纯整数与纯字母产品名不校验，防「35 亿↔3.5 billion」互译与
+  中文音译误杀）；剔除明细记 console.error
+- **P0-① 精选标准 rubric 化**：四维打分（影响面/信息密度/来源权威/时效性）
+  先理由后分数，normScore 容错（夹 1-10、缺维中性 5），parseDigest 总分
+  降序后取 12；自报分只排序不设阈值
+- **P1-⑤ embedding 事件聚类 v1**：bge-m3 批量 embedding（1 子请求）+
+  cosine ≥ 0.85 从严 + 48h 时间门限 + 并查集；「拿不准不合并」
+  （0.80-0.85 记 near 供 aiTrace）；ts=0 从严不聚类；失败整体跳过不阻断日报
+
+**其余审查项**
+- **B2 `sendBatch` 批量入队**：抓取/推送入队计 1 子请求（cron 班子请求 5→2），
+  保序 + `max_concurrency=1` 串行消费者
+- **D2 fixture 契约测试 + dry-run 巡检**：`src/__fixtures__/` 真实 feed 快照
+  （OpenAI RSS 3 条含 CDATA/实体、Apple EDGAR atom 10 条 ISO-8859-1）；
+  新路由 `/api/fetch?dry=1&shard=N` 只抓取解析，不 enrich/AI/推送/写 KV/入队
+- **C5 公共 helper**：`mkItem`（三解析器统一条目构造）、`markRun`（9 处埋点统一，
+  catch 吞掉语义写明）、`sliceChunks`（两处切分统一）
+- **C6 魔法数字入 config**：15 个截断/批量/TTL 常量进 §1
+
+**B4 量化结论**（`docs/外部AI审查_作者复核.md`）：两轮离线统计 106 条原始条目、
+跨源同事件候选 0 个——一手来源策略下官方源不互相转载，**维持「低则不上
+SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
+
+**新增测试**
+- smoke 31 → 79 项：精选五项全套断言（归一化不误杀/型号编造拦截/中文音译
+  不误杀/rubric 排序与容错/cosine/cluster 门限与 near）、B2 记账、
+  C5 透传与截断、C6 常量、fixture 契约；合计 **118 项**全绿
+
+**验证**
+- 118 项测试全绿 → 部署版本 **29f4dedd**（d3c2db9）
+- `/api/diag` 200（items 149 / digest 9 / digestErr 空）→ 页面 200 →
+  生产 dry-run 分片 0（234 原始 → 61 条，0 失败，预算 11/50）
+- 5 队列就位，guji-digest 队列级 `delivery_delay=90` 未受部署影响；
+  4 个 cron 表达式（6 触发点）在线
+- **新 digest 路径未手动触发**（会砍掉 05:50 定时班 fresh 窗口，DEVLOG §4.6.5），
+  留给 05:40-06:00 无人值守首班自然验收
+
 ## v4.0 · 2026-10-25 · 队列化架构上线
 
 **架构**
