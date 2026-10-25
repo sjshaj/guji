@@ -75,13 +75,28 @@ npx wrangler secret put ZHIPU_API_KEY    # 智谱 GLM-4-plus（中文精选主�
 npx wrangler secret put TG_BOT_TOKEN     # Telegram bot token（推送）
 npx wrangler secret put TG_CHAT_ID       # Telegram 私聊 chat id（推送目标）
 
-# 4. 本地冒烟 + 端到端测试（mock 全部外部依赖，不需要密钥）
+# 4. 本地冒烟 + 端到端测试（mock 全部外部依赖，不需要密钥和网络）
 node src/smoke-v4.mjs   # 17 项
 node src/e2e-v4.mjs     # 39 项
 
-# 5. 部署
+# 5. 本地 dev（可选，注意沙箱限制见下）
+cd src && npx wrangler dev --port 8787
+
+# 6. 部署
 cd src && npx wrangler deploy
 ```
+
+**本地开发须知（沙箱/本机环境的已知限制，别浪费时间试）**：
+
+- `api.telegram.org` 在沙箱 DNS 被污染（解析到 Facebook IP）——
+  **TG 推送只能线上验证**，本地测不通是正常的
+- `guji.2698553157.workers.dev` 子域在沙箱不可达——生产域名只有
+  `https://guji.dpdns.org`
+- 沙箱里 Node fetch 有波动（偶发 000/502），同一测试跑三遍再下结论
+- 测试文件不需要 secret/网络：mock 了 KV/队列/AI/fetch，
+  改完逻辑先跑它们（56 项）再部署
+- **怎么加测试**：照 `smoke-v4.mjs` 的 `ok(cond, name)` 模式追加即可；
+  纯函数（parsers/tgTruncate/分片键/预算记账）进 smoke，跨模块链路进 e2e
 
 **部署后必做**（详见 `docs/GUJI-代码重构交接.md` §8）：
 
@@ -97,10 +112,16 @@ curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/queues/$Q
 ```
 guji/
 ├── README.md                    # 本文件：项目门面
-├── DEVLOG.md                    # ★ 从零到 v4 的完整开发日志（所有踩坑与修复的详细逻辑）
+├── DEVLOG.md                    # ★ 从零到 v4 的完整开发日志（每版写法+错误+反思，596 行）
 ├── ROADMAP.md                   # 接下来的更新计划（续写接口）
+├── CHANGELOG.md                 # 版本变更事实清单（按时间倒序）
+├── LICENSE                      # MIT
 ├── docs/
-│   └── GUJI-代码重构交接.md      # 代码地图/硬约束/部署运维说明书（2451 行）
+│   ├── GUJI-代码重构交接.md      # 代码地图/硬约束/部署运维说明书（2451 行）
+│   ├── 首次cron验收手册.md       # v4 首班无人值守运行的验收清单（按时间序）
+│   ├── 源病历.md                # 39 源健康档案：谁被挡过/谁偶发故障/怎么排查
+│   ├── 故障排查Runbook.md       # 症状 → 查什么 → 常见根因（含紧急恢复）
+│   └── archive/                 # 历史快照（源清单副本、未引用资源，只作存档）
 └── src/
     ├── index.js                 # 全部线上代码（1699 行，按 §1-§15 区分区）
     ├── wrangler.toml            # Worker + KV + Queues + cron 配置（注释即文档）
@@ -108,6 +129,17 @@ guji/
     ├── smoke-v4.mjs             # 17 项冒烟测试（mock KV/队列/AI/fetch）
     └── e2e-v4.mjs               # 39 项端到端测试
 ```
+
+## 文档索引（出问题先查哪份）
+
+| 你的问题 | 去这里 |
+|---|---|
+| 这代码为什么这么写？/ 接手项目 | `DEVLOG.md` → `docs/GUJI-代码重构交接.md` |
+| 某源的条目不出现 | `docs/源病历.md` |
+| 页面/推送/AI/队列出了问题 | `docs/故障排查Runbook.md` |
+| 今晚（或每次）cron 跑完怎么验收 | `docs/首次cron验收手册.md` |
+| 接下来做什么 / 我改完怎么记录 | `ROADMAP.md` |
+| 这个版本改了什么 | `CHANGELOG.md` |
 
 ## 给接手者的阅读顺序
 

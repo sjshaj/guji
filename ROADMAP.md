@@ -28,7 +28,9 @@
 ## B. v4 稳定性（线上运行中暴露的）
 
 - [ ] **B1. 今晚 21:40 首验**：v4 首次无人值守 cron（北京 21:40/21:50/22:00 晚班三连）
-      - 验收：次日上午 `/api/diag` + 推送结果 + KV run 记录齐全
+      - 完整步骤见 `docs/首次cron验收手册.md`（按时间序：diag 字段合格线 → KV run
+        记录四条 fetch 全 ok → TG 收报头+N 条 → 页面计数恢复）
+      - 基准线：items ≥100、digest 8-12、digestErr 空、4 分片全 ok、DLQ 空
 - [ ] **B2. 定位「分片消费者成批消失」根因**（DEVLOG §5.5 事件）
       - 现状：15:14/15:25 两次 build 出现 4 个抓取消费者只 1 个完成、其余无痕迹消失；
         重新部署后恢复；沙箱 wrangler tail 不可用，根因未定位
@@ -93,6 +95,9 @@
 - [x] **SEC EDGAR 源方案**（10-24 中午，替代被 Cloudflare 防护挡住的 B 组硬件 IR 站点）
 - [x] **「只有 2 个源」splice bug 修复**（10-24 13:07，160 条/班）
 - [x] **GitHub 公开仓库 + 完整开发日志**（10-25 17:30）
+- [x] **仓库文档缺口补齐**（10-25 18:20）：LICENSE（MIT 落地）、首次 cron 验收手册、
+      39 源健康病历、故障排查 Runbook、CHANGELOG、本地开发指南；
+      feeds-list 快照与未引用 logo 归档 docs/archive/
 
 </details>
 
