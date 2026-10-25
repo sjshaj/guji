@@ -209,5 +209,48 @@ const fxEdgeOut = m.parseXmlFeed(fxEdge, { id: 'edge', name: 'Edge', cat: '模�
 ok(fxEdgeOut.length === 2, 'fixture 边缘：2 条（无日期条目不在此处判死）');
 ok(fxEdgeOut[0].title === 'Edge & Case' && fxEdgeOut[0].desc === 'desc bold', 'fixture 边缘：实体解码正确（&amp; &lt; 还原，无双重解码）');
 
+// ---- v4.0.2.1 批次 6：C5 鉴权 / D2 DLQ 告警 / B3 新鲜度 / D4 健康度 ----
+
+// C5 diag 鉴权（未配置放行=灰度；配置后精确匹配）
+ok(m.diagAuthorized('x', {}).ok === true, 'diagAuthorized：未配置 DIAG_KEY → 放行（灰度上线）');
+ok(m.diagAuthorized('s3cret', { DIAG_KEY: 's3cret' }).ok === true, 'diagAuthorized：key 正确 → 放行');
+ok(m.diagAuthorized('wrong', { DIAG_KEY: 's3cret' }).ok === false, 'diagAuthorized：key 错误 → 拒绝');
+ok(m.diagAuthorized(null, { DIAG_KEY: 's3cret' }).ok === false, 'diagAuthorized：缺 key → 拒绝');
+ok(m.diagAuthorized('s3cret', { DIAG_KEY: 's3cret' }).err === undefined, 'diagAuthorized：放行时不带错误文案');
+
+// D2 DLQ 告警文本（私聊运维向：班次 + 条数 + 排查指向）
+const alert = m.renderDlqAlert('2026-10-26-am', 3);
+ok(alert.includes('2026-10-26-am') && alert.includes('3 条'), 'renderDlqAlert：含班次与条数');
+ok(alert.includes('guji-dlq') && alert.includes('运维'), 'renderDlqAlert：指明死信队列与运维属性');
+
+// B3 分片新鲜度（阈值内算新、超过算旧、缺时间戳不校验=向后兼容）
+const MSG_AT = 1792936800000;
+ok(m.isStaleShard({ at: MSG_AT - 60000 }, MSG_AT) === false, 'isStaleShard：早 1 分钟的分片 → 新鲜');
+ok(m.isStaleShard({ at: MSG_AT - 11 * 60000 }, MSG_AT) === true, 'isStaleShard：早 11 分钟（>10 分钟阈值）→ 过期');
+ok(m.isStaleShard({ at: MSG_AT + 5000 }, MSG_AT) === false, 'isStaleShard：晚于入队时刻 → 新鲜（本轮写的）');
+ok(m.isStaleShard({}, MSG_AT) === false, 'isStaleShard：分片缺 at → 不校验（旧数据兼容）');
+ok(m.isStaleShard({ at: 1 }, 0) === false, 'isStaleShard：消息缺 at → 不校验（在途旧消息兼容）');
+
+// D4 健康度聚合（正常失败归源；分片整体失败退化为全源各记一次；rate 计算）
+const feedsByShard = [['OpenAI', 'DeepMind'], ['Nvidia', "Tom's Hardware"]];
+const runs = [
+  { shard: 0, ok: true, failedSources: ['DeepMind'] },
+  { shard: 0, ok: true, failedSources: [] },
+  { shard: 1, ok: true, failedSources: [] },
+  { shard: 1, ok: false }, // 整片失败：退化路径
+];
+const h = m.aggregateHealth(runs, feedsByShard);
+ok(h.shardRuns === 4, 'aggregateHealth：run 计数');
+ok(h.bySource['DeepMind'].fail === 1 && h.bySource['DeepMind'].seen === 2 && h.bySource['DeepMind'].rate === 0.5, 'aggregateHealth：逐源失败归源 + rate=1-1/2');
+ok(h.bySource['Nvidia'].fail === 1 && h.bySource['Nvidia'].seen === 2, 'aggregateHealth：整片失败退化为该片全源各记一次');
+ok(h.bySource['OpenAI'].fail === 0 && h.bySource['OpenAI'].rate === 1, 'aggregateHealth：无失败源 rate=1');
+ok(m.aggregateHealth([], feedsByShard).bySource['OpenAI'].rate === null, 'aggregateHealth：无数据时 rate=null（不除零）');
+ok(m.aggregateHealth(runs, feedsByShard).bySource['Nope'] === undefined, 'aggregateHealth：未配置源不出现在输出');
+
+// pastWindow（健康度聚合的历史班次键）
+ok(m.pastWindow(Date.UTC(2026, 9, 26, 2, 0), 0, 'am') === '2026-10-26-am', 'pastWindow：当天（北京 10-26 10:00 → am）');
+ok(m.pastWindow(Date.UTC(2026, 9, 26, 2, 0), 1, 'pm') === '2026-10-25-pm', 'pastWindow：前一天 pm');
+ok(m.pastWindow(Date.UTC(2026, 9, 1, 2, 0), 1, 'am') === '2026-09-30-am', 'pastWindow：跨月（10-01 北京 → 9-30）');
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

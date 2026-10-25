@@ -51,6 +51,9 @@ import { XMLParser } from 'fast-xml-parser';
 // ---------------- KV ----------------
 const KV_KEY = 'guji:v4:latest';       // 主状态：{items, failures, generatedAt, digest, lastDigestAt, window, logs, digestErr, aiTrace, budget}
 const SEEN_SET_KEY = 'guji:v4:seen';   // 跨调用去重集合（Anthropic slug，单次读写）
+// DLQ 班次计数与告警去重（v4.0.2.1，ROADMAP D2：死信没人看 → 班次结束汇总告警）
+const dlqCountKey = win => `guji:v4:dlqcount:${win}`;
+const dlqAlertedKey = win => `guji:v4:dlqalerted:${win}`;
 
 // ---------------- 队列 ----------------
 // 队列名须与 wrangler.toml [[queues.producers]] 一致；v4 部署时自动创建。
@@ -67,6 +70,13 @@ const SEND_SLICES = 3;          // 推送分片数（顺序发送，保序；单
 // 生产 cron 路径 :40 抓取 → :50 精选有 10 分钟缓冲，通常首轮即就绪）
 const SHARD_WAIT_MS = 45000;
 const SHARD_POLL_MS = 5000;
+// 分片新鲜度阈值（v4.0.2.1，ROADMAP B3）：分片写入时间比 digest 消息入队时间
+// 早这么久以上 → 判定为「上一班的旧分片」，宁可继续等/重试也不误用
+// （同 window 二次 build 会读到旧分片，用过时报等于把旧闻当新闻播）。
+// 取值依据：正常路径分片 at 与 digest 入队时刻相差在分钟级（fetch 并行 +
+// digest 90s 延迟），而旧分片至少差一个班次（≥10 小时），10 分钟阈值
+// 两边都不误伤；且 SHARD_WAIT_MS=45s 内写出的分片必然新鲜，不会自锁。
+const SHARD_STALE_MS = 10 * 60 * 1000;
 
 // ---------------- 班次键 ----------------
 // 分片/运行记录的 KV 键都带 window，早晚班互不覆盖，旧键靠 TTL 自动清扫。
@@ -166,6 +176,10 @@ const ERR_SNIP_MAX = 80;       // 错误信息截断（日志/失败记录防爆
 const ERR_RECORD_MAX = 300;    // KV 错误记录体的截断（比日志宽，保留排查线索）
 const AI_TRACE_HEAD_MAX = 120; // aiTrace 里模型输出头部预览长度（诊断「模型回了什么」）
 const RUN_TTL = 2 * 86400;     // run/分片 KV 记录的 TTL（秒）——覆盖下一班同 window 键前的保洁
+const HEALTH_DAYS = 3;         // diag ?health=1 的聚合天数（v4.0.2.1，ROADMAP D4）。
+                              // 3 天 × 2 班 × 4 片 = 24 次 KV 读，叠加现有 diag 读取
+                              // 仍在 50 子请求内；「近 7 天」需 56 次读会超预算，
+                              // 故取 3 天（要 7 天用外部脚本拉 run 记录，理由见路由注释）
 
 // ---------------- 抓取参数 ----------------
 const UA_CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
@@ -279,6 +293,17 @@ const isFresh = (tsMs, lastAtSec) => (Number(tsMs) || 0) > toMs(lastAtSec);
 export function currentWindow(tsMs = Date.now()) {
   const d = bjDate(tsMs);
   const edition = d.getUTCHours() < 12 ? 'am' : 'pm';
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${edition}`;
+}
+
+/**
+ * 过去某天的班次键（v4.0.2.1，ROADMAP D4 健康度聚合用）。
+ * @param {number} tsMs   参照时刻（一般传 now）
+ * @param {number} daysAgo 前几天（0 = 参照日）
+ * @param {'am'|'pm'} edition 班次
+ */
+export function pastWindow(tsMs, daysAgo, edition) {
+  const d = bjDate(tsMs - daysAgo * 86400000);
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${edition}`;
 }
 
@@ -741,6 +766,21 @@ export async function fetchAnthropic(source, net) {
 // （10 源，约 13/50 子请求）。本区包含两个纯函数/准纯函数：
 //   fetchShardFeeds —— 一片源的抓取（并发 + 兜底超时）
 //   finalizeItems   —— 跨分片合并后的后处理（过滤/限额/去重/排序），可单测
+
+// ---------------- 分片新鲜度（v4.0.2.1，ROADMAP B3） ----------------
+
+/**
+ * 判定分片是否「过期」（属于上一班，不该被本轮 digest 消费）。
+ * 语义：分片写入时间 at 比 digest 消息入队时间 msgAt 早 SHARD_STALE_MS 以上。
+ * 缺任一时间戳时不校验（向后兼容：v4.0.2.1 之前入队的在途消息没有 at）。
+ * @param {object} shard  KV 读出的分片值（含 at 字段）
+ * @param {number} msgAt  digest 消息入队时刻（ms）
+ * @returns {boolean} true = 过期，调用方应视为「未就绪」继续等/重试
+ */
+export function isStaleShard(shard, msgAt) {
+  if (!msgAt || !shard || !shard.at) return false;
+  return shard.at < msgAt - SHARD_STALE_MS;
+}
 
 // ---------------- 分类微调 ----------------
 // 模型类里提到数据中心/能源/代工的，归到数据中心（避免「芯片算力」吃掉一切）
@@ -1374,6 +1414,16 @@ export function renderTgItem(it, idx, total) {
 }
 
 /**
+ * DLQ 班次告警文本（v4.0.2.1，ROADMAP D2）。只发私聊（运维向），不进日报频道。
+ * @param {string} window 班次键（如 2026-10-26-am）
+ * @param {number} count  本班次进死信队列的消息条数
+ */
+export function renderDlqAlert(window, count) {
+  return `⚠️ GUJI 运维告警：${window} 班次有 ${count} 条消息进入死信队列（guji-dlq）。\n`
+    + '说明抓取/精选/推送链路有环节重试耗尽——请查 Workers 控制台 [dlq] 日志与 KV run 记录定位。';
+}
+
+/**
  * 生成待推送的消息列表。
  * 有精选 → 报头 + N 条精选；无精选（AI 不可用）→ 退回英文标题清单，合并为一条。
  */
@@ -1629,7 +1679,12 @@ async function consumeFetch(batch, env) {
       await net.kvPut(shardKey(window, shard), JSON.stringify({ items, failures, at: Date.now() }),
         { expirationTtl: RUN_TTL }, `shard:${shard}`);
       await markRun(net, window, `fetch:${shard}`, {
-        at: Date.now(), shard, ok: true, items: items.length, failures: failures.length, budget: budget.report()
+        at: Date.now(), shard, ok: true, items: items.length, failures: failures.length,
+        // v4.0.2.1（ROADMAP D4）：逐源失败明细——原先只记数量，diag 无法回答
+        // 「是哪个源在挂」（健康度仪表盘的数据源）。分片 ≤10 源，天然有界，
+        // slice(0,20) 只是防御性兜底。
+        failedSources: failures.map(f => f.name).slice(0, 20),
+        budget: budget.report()
       }, 'run:fetch');
       msg.ack();
       console.error(`[fetch] ${window} 分片${shard}：${items.length} 条，失败 ${failures.length} 个源，预算 ${budget.total}/${budget.limit}`);
@@ -1673,6 +1728,7 @@ async function consumeDigest(batch, env) {
   //    此处轮询是双保险：抓取异常慢时在调用内等，不烧队列重试次数）
   let shards = null;
   const deadline = Date.now() + SHARD_WAIT_MS;
+  let staleSeen = false; // 见到过过期分片（超时留痕用，区分「没写」与「写旧了」）
   const markDigest = (extra) => markRun(net, window, 'digest', {
     at: Date.now(), ok: false, budget: budget.report(), ...extra
   }, 'run:digest:err');
@@ -1681,13 +1737,20 @@ async function consumeDigest(batch, env) {
     let ready = true;
     for (let n = 0; n < SHARD_COUNT; n++) {
       const s = await net.kvGet(shardKey(window, n), 'json', `shard:${n}`).catch(() => null);
-      if (!s || !Array.isArray(s.items)) { ready = false; break; }
+      // v4.0.2.1（ROADMAP B3）：分片存在但过期（上一班的）同样视为未就绪——
+      // 误用旧分片会把旧闻当新闻播，宁可重试/进 DLQ（D2 告警兜底）
+      if (!s || !Array.isArray(s.items) || isStaleShard(s, msg.body.at)) {
+        if (s && isStaleShard(s, msg.body.at)) staleSeen = true;
+        ready = false; break;
+      }
       attempt.push(s);
     }
     if (ready) { shards = attempt; break; }
     if (Date.now() >= deadline) {
-      await markDigest({ stage: 'shard-wait-timeout', waitedMs: SHARD_WAIT_MS });
-      throw new Error(`分片未就绪（等待 ${SHARD_WAIT_MS / 1000}s 仍缺失，window=${window}，抓取班失败？）`);
+      await markDigest({ stage: staleSeen ? 'shard-stale-timeout' : 'shard-wait-timeout', waitedMs: SHARD_WAIT_MS });
+      throw new Error(staleSeen
+        ? `分片过期（等待 ${SHARD_WAIT_MS / 1000}s 仍只有上一班旧分片，本轮抓取未完成？window=${window}）`
+        : `分片未就绪（等待 ${SHARD_WAIT_MS / 1000}s 仍缺失，window=${window}，抓取班失败？）`);
     }
     // 预算护栏：轮询消耗超过 40 就中止，交给队列重试（每次重试都有全新 50 预算，
     // 10 次重试 × 45s ≈ 7.5 分钟总覆盖，且任何单次调用都不越限）
@@ -1695,7 +1758,7 @@ async function consumeDigest(batch, env) {
       await markDigest({ stage: 'shard-wait-budget', total: budget.total });
       throw new Error(`等分片期间预算已达 ${budget.total}/50，中止本轮等待（队列将重试）`);
     }
-    log(`分片未就绪，${SHARD_POLL_MS / 1000}s 后重试…`);
+    log(staleSeen ? `分片过期（上一班旧分片），${SHARD_POLL_MS / 1000}s 后重试…` : `分片未就绪，${SHARD_POLL_MS / 1000}s 后重试…`);
     await sleep(SHARD_POLL_MS);
   }
   const rawItems = shards.flatMap(s => s.items);
@@ -1811,6 +1874,24 @@ async function consumeSend(batch, env) {
     await markRun(net, window, 'push', { at: Date.now(), ok: okCount, total: results.length }, 'run:push');
   }
 
+  // v4.0.2.1（ROADMAP D2）：最后一个推送分片完成 = 班次结束点，汇总死信告警。
+  // 选最后分片而非 slice 0：本班 fetch/digest 的重试耗尽大多在 :50-:00 之间
+  // 落地 DLQ，末尾触发能多覆盖几秒的迟到死信（仍不保证全覆盖——竞态如实
+  // 写在注释里，告警是「该看了」的信号，不是精确记账）。
+  // 只发私聊 TG_CHAT_ID（运维向，不进日报频道）；alerted 键去重（消息级
+  // 重试不会重复告警）；整体 try/catch——告警失败绝不影响推送主流程。
+  const lastSlice = (typeof slices === 'number' ? slices : SEND_SLICES) - 1;
+  if (slice === lastSlice && net.env.TG_CHAT_ID) {
+    try {
+      const n = (await net.kvGet(dlqCountKey(window), 'json', 'dlq:alert-read')) || 0;
+      if (n > 0 && !(await net.kvGet(dlqAlertedKey(window), 'json', 'dlq:alert-dedupe'))) {
+        await sendChunk(net, [{ chat: net.env.TG_CHAT_ID, i: 0, text: renderDlqAlert(window, n) }]);
+        await net.kvPut(dlqAlertedKey(window), Date.now(), { expirationTtl: RUN_TTL }, 'dlq:alert-flag');
+        console.error(`[send] DLQ 告警已推送：${window} 本班死信 ${n} 条`);
+      }
+    } catch (e) { console.error('[send] DLQ 告警失败（不影响推送主流程）：' + (e && e.message)); }
+  }
+
   // v4.0.1（外部审查 A1）：失败项分流——瞬时失败入补推队列，永久错误放弃并留痕
   //
   // 【设计决策：为什么不用 msg.retry()】Cloudflare Queues 的 msg.retry() 是
@@ -1911,8 +1992,20 @@ async function consumeRetry(batch, env) {
  * 排查入口：wrangler tail 搜 [dlq]，或 /api/diag 看对应 run 记录缺失。
  */
 async function consumeDlq(batch, env) {
+  const budget = createBudget();
+  const net = createNet(env, budget);
   for (const msg of batch.messages) {
     console.error(`[dlq] 死信（重试耗尽）：${JSON.stringify(msg.body).slice(0, 500)}`);
+    // v4.0.2.1（ROADMAP D2）：按班次累加死信计数，推送班结束时汇总告警
+    // （原先只 console.error——线上没人看 console，等于没有告警）。
+    // 读-改-写竞态可忽略：死信是罕见路径，且同班次多条 DLQ 的串行消费
+    // （max_concurrency 默认小）下冲突概率极低；最坏后果是计数少几条，
+    // 而下界仍有告警（>0 即报）。
+    const win = (msg.body && msg.body.window) || 'unknown';
+    try {
+      const n = (await net.kvGet(dlqCountKey(win), 'json', 'dlq:count')) || 0;
+      await net.kvPut(dlqCountKey(win), n + 1, { expirationTtl: RUN_TTL }, 'dlq:count+1');
+    } catch (e) { /* 计数失败不影响主流程（console 已有留痕） */ }
     msg.ack();
   }
 }
@@ -1922,6 +2015,58 @@ async function consumeDlq(batch, env) {
 // ============================================================
 
 // ---------------- 诊断辅助 ----------------
+
+/**
+ * diag 端点鉴权（v4.0.2.1，ROADMAP C5）：诊断端点暴露源健康度与预算消耗，
+ * 没必要公开。配置了 env.DIAG_KEY 时 ?key= 必须精确匹配；未配置时放行
+ * （灰度策略：先上代码，secret 一经设置即生效，不锁死任何部署流程）。
+ * @param {string|null} key  请求带的 key
+ * @param {object} env       Worker 环境
+ * @returns {{ok: boolean, err?: string}}
+ */
+export function diagAuthorized(key, env) {
+  const want = env && env.DIAG_KEY;
+  if (!want) return { ok: true };
+  if (key === want) return { ok: true };
+  return { ok: false, err: 'diag 需要正确的 ?key=（DIAG_KEY 未设置时免鉴权）' };
+}
+
+/**
+ * 聚合近 N 天的源健康度（v4.0.2.1，ROADMAP D4：failures 只在 build 响应里，
+ * 没人盯着看 → diag 汇总近若干天各源成功率）。
+ * 纯函数：输入 run 记录数组 + 分片→源名映射，输出各源失败/参跑统计。
+ * seen = 该源所在分片的全部班次（成功+失败都算一次参跑：分片级失败时
+ * 无法知道单个源是否无辜，按「该班次没覆盖到」记失败，rate 因此偏保守）。
+ * @param {Array<{shard:number, ok:boolean, failedSources?:string[]}>} runs 各班次各分片的 run 记录
+ * @param {string[][]} feedsByShard 分片→源名数组（与 FEEDS 切分一致）
+ * @returns {{bySource: object, shardRuns: number}} bySource[name] = {fail, seen, rate}
+ */
+export function aggregateHealth(runs, feedsByShard) {
+  const bySource = {};
+  const shardRuns = new Array(feedsByShard.length).fill(0);
+  for (const r of runs) {
+    if (!r || typeof r.shard !== 'number' || r.shard >= feedsByShard.length) continue;
+    shardRuns[r.shard]++; // 分母 = 该分片的全部班次（成功+失败都算一次参跑）
+    const failed = Array.isArray(r.failedSources) ? r.failedSources : [];
+    for (const name of (r.ok ? failed : (feedsByShard[r.shard] || []))) {
+      // 分片整体失败（ok=false）时没有逐源明细，退化为「该片全部源各记一次失败」；
+      // 有逐源明细时只记明细里的（旧记录没有 failedSources 字段，同样走退化路径）
+      if (!bySource[name]) bySource[name] = { fail: 0, seen: 0 };
+      bySource[name].fail++;
+    }
+  }
+  for (let s = 0; s < feedsByShard.length; s++) {
+    for (const name of feedsByShard[s] || []) {
+      if (!bySource[name]) bySource[name] = { fail: 0, seen: 0 };
+      bySource[name].seen += shardRuns[s];
+    }
+  }
+  for (const name of Object.keys(bySource)) {
+    const v = bySource[name];
+    v.rate = v.seen > 0 ? Math.round((1 - v.fail / v.seen) * 1000) / 1000 : null;
+  }
+  return { bySource, shardRuns: runs.length };
+}
 
 /**
  * 实时探测 AI 绑定是否可用（排查「精选 0 条」）。
@@ -1956,8 +2101,8 @@ async function probeZhipu(net) {
 
 const JSON_HEADERS = { 'content-type': 'application/json', 'access-control-allow-origin': '*' };
 
-function json(body, pretty = false) {
-  return new Response(JSON.stringify(body, null, pretty ? 1 : 0), { headers: JSON_HEADERS });
+function json(body, pretty = false, status = 200) {
+  return new Response(JSON.stringify(body, null, pretty ? 1 : 0), { status, headers: JSON_HEADERS });
 }
 
 const LOADING_PAGE = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GUJI</title><style>body{background:#0b0d12;color:#e8ecf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}</style></head><body><div>正在生成今日情报（队列处理中，约 1 分钟）…<script>setTimeout(()=>location.reload(),10000)</script></div></body></html>`;
@@ -1990,7 +2135,9 @@ async function enqueueFetch(env, net, window) {
  */
 async function enqueueBuild(env, net, window, full) {
   await enqueueFetch(env, net, window);
-  await net.qSend(env.GUJI_DIGEST_Q, { kind: 'digest', window, full }, 'digest');
+  // at = 入队时刻：供精选消费者做分片新鲜度校验（B3，v4.0.2.1）——
+  // 分片 at 比它早 10 分钟以上即判定为上一班旧分片，不误用
+  await net.qSend(env.GUJI_DIGEST_Q, { kind: 'digest', window, full, at: Date.now() }, 'digest');
 }
 
 /** 入队一次「推送」（3 个顺序分片） */
@@ -2026,7 +2173,8 @@ export default {
           await enqueueFetch(env, net, window);
           console.error(`[cron] ${window} 抓取入队：${SHARD_COUNT} 分片，预算 ${budget.total}`);
         } else if (minute === DIGEST_MINUTE) {
-          await net.qSend(env.GUJI_DIGEST_Q, { kind: 'digest', window, full: false }, 'digest');
+          // at 同 enqueueBuild：供分片新鲜度校验（B3，v4.0.2.1）
+          await net.qSend(env.GUJI_DIGEST_Q, { kind: 'digest', window, full: false, at: Date.now() }, 'digest');
           console.error(`[cron] ${window} 精选入队，预算 ${budget.total}`);
         } else if (minute === SEND_MINUTE) {
           await enqueueSend(env, net, window, false);
@@ -2115,8 +2263,43 @@ export default {
 
     // 诊断：latest 状态 + 分片就绪情况 + 实时探测 AI 配额（排查「精选 0 条」）
     if (url.pathname === '/api/diag') {
+      // v4.0.2.1（ROADMAP C5）：鉴权——暴露源健康度与预算消耗的端点不公开
+      const auth = diagAuthorized(url.searchParams.get('key'), env);
+      if (!auth.ok) return json({ error: auth.err }, true, 403);
       const budget = createBudget();
       const net = createNet(env, budget);
+
+      // v4.0.2.1（ROADMAP D4）：?health=1 → 源健康度模式：近 3 天各源成功率。
+      // 按需开启的原因：3 天 × 2 班 × 4 片 = 24 次 KV 读，叠加实时探测会超
+      // 50 子请求上限，故此模式跳过 probes 与 latest（健康检查不需要它们）。
+      // 「近 7 天」需要 56 次读，超预算——取 3 天；要 7 天用外部脚本拉 run 记录。
+      if (url.searchParams.get('health') === '1') {
+        const runs = [];
+        const now = Date.now();
+        for (let d = 0; d < HEALTH_DAYS; d++) {
+          for (const ed of ['am', 'pm']) {
+            const w = pastWindow(now, d, ed);
+            for (let n = 0; n < SHARD_COUNT; n++) {
+              const r = await net.kvGet(runKey(w, `fetch:${n}`), 'json', `health:${w}:${n}`).catch(() => null);
+              if (r) runs.push(r);
+            }
+          }
+        }
+        const feedsByShard = [];
+        for (let n = 0; n < SHARD_COUNT; n++) {
+          feedsByShard.push(FEEDS.slice(n * SHARD_SIZE, (n + 1) * SHARD_SIZE).map(f => f.name));
+        }
+        const health = aggregateHealth(runs, feedsByShard);
+        const bad = Object.entries(health.bySource)
+          .filter(([, v]) => v.fail > 0)
+          .sort((a, b) => b[1].fail - a[1].fail);
+        return json({
+          health: { days: HEALTH_DAYS, shardRuns: health.shardRuns, expectedRuns: HEALTH_DAYS * 2 * SHARD_COUNT },
+          sourcesWithFailures: bad.map(([name, v]) => ({ name, fail: v.fail, seen: v.seen, rate: v.rate })),
+          budget: budget.report(),
+        }, true);
+      }
+
       let data = null;
       try { data = await net.kvGet(KV_KEY, 'json', 'state:latest'); } catch (e) {}
       const win = (data && data.window) || currentWindow(Date.now());
@@ -2177,11 +2360,11 @@ export {
   // §1 config
   KV_KEY, SEEN_SET_KEY,
   Q_FETCH, Q_DIGEST, Q_SEND, Q_RETRY, Q_DLQ,
-  SHARD_SIZE, SHARD_COUNT, SEND_SLICES, SHARD_WAIT_MS, SHARD_POLL_MS, shardKey, runKey,
+  SHARD_SIZE, SHARD_COUNT, SEND_SLICES, SHARD_WAIT_MS, SHARD_POLL_MS, SHARD_STALE_MS, shardKey, runKey,
   // §1 截断/批量常量（v4.0.2 C6：魔法数字入 config）
   PARSE_ITEMS_MAX, EDGAR_ENTRIES_MAX, EDGAR_ITEMS_MAX, TITLE_MAX, LINK_MAX, DESC_MAX, EDGAR_DESC_MAX,
   DIGEST_TITLE_MAX, DIGEST_SUMMARY_MAX, DIGEST_REASON_MAX, PROMPT_DESC_MAX, ERR_SNIP_MAX, ERR_RECORD_MAX,
-  AI_TRACE_HEAD_MAX, RUN_TTL,
+  AI_TRACE_HEAD_MAX, RUN_TTL, HEALTH_DAYS,
   ENRICH_MAX, HTML_MAX, MAX_AGE,
   AI_KW, isAI, FEEDS,
   UA_CHROME, FETCH_MS, BATCH_MS, CONCURRENCY,
