@@ -4,10 +4,13 @@
 > 当前状态：**v4 队列化架构已上线运行**（2026-10-25 部署，Version ID `bfce87d9-ae8f-4285-9c26-14cc5639510d`）。
 > 任何改动前必须读第 2 节硬约束；改完必须跑第 8 节的验证全家桶。
 >
-> **版本注记（2026-10-25 深夜，v4.0.1）**：本文按 v4.0（commit `0482501`，1699 行、
-> smoke 17 项）撰写，文中行号区间与「17 项/56 项」均为该版快照。当前线上为
-> **v4.0.1**（1825 行、smoke 31 项、e2e 39 项 = 70 项，新增 guji-retry 补推队列），
-> 变更清单见 `CHANGELOG.md` v4.0.1 节、设计决策见 `DEVLOG.md` §4.5。
+> **版本注记（2026-10-26 凌晨，v4.0.2.1）**：本文按 v4.0（commit `0482501`，1699 行、
+> smoke 17 项）撰写，文中行号区间与早期「17 项/56 项」均为该版快照。线上已迭代至
+> **v4.0.2.1**（2386 行、smoke 100 项、e2e 39 项 = 139 项）：v4.0.1 新增 guji-retry
+> 补推队列；v4.0.2 精选五项 + B2 sendBatch + fixture/dry-run + C5/C6 重构；
+> v4.0.2.1 运维加固（C5 diag 鉴权灰度 / D2 DLQ 告警 / B3 分片新鲜度 /
+> D3 GitHub Actions 巡检 / D4 源健康度聚合）。
+> 变更清单见 `CHANGELOG.md`，设计决策见 `DEVLOG.md` §4.5-§4.7。
 > 具体行号以 `src/index.js` 实际为准，§1-§15 分区结构不变。
 
 ---
@@ -25,7 +28,7 @@
 原 v3 时代文档里的「重构任务指令」（预算显式化 / 关注点分离 / 可验证）已全部执行完毕，结论并入本文档；后续维护者的纪律简化为三条：
 
 1. **新增任何子请求前，先过 §6 的 budget 账**（每个消费者调用独立 50 上限，但纪律不变）
-2. **改完跑 `node smoke-v4.mjs && node e2e-v4.mjs`**（17 + 39 项，全绿才准部署）
+2. **改完跑 `node smoke-v4.mjs && node e2e-v4.mjs`**（100 + 39 项，全绿才准部署）
 3. **部署后按 §8 验证**（build → 观察 run 记录 → push → diag），无人值守链路以「第二天推送结果」为准
 
 ---
@@ -159,7 +162,7 @@ index.js（1699 行）
 └── §15 exports   对外导出（1668-1699）            —— 供单测与调试引用，Worker 只用 default 导出
 ```
 
-配套文件：`wrangler.toml`（绑定 + 4 队列 + cron）、`package.json`（唯一依赖 fast-xml-parser）、`smoke-v4.mjs`（17 项冒烟）、`e2e-v4.mjs`（39 项端到端，mock KV/队列/AI/fetch 全链路）。原文均在 §6。
+配套文件：`wrangler.toml`（绑定 + 5 队列 + cron）、`package.json`（唯一依赖 fast-xml-parser）、`smoke-v4.mjs`（100 项冒烟）、`e2e-v4.mjs`（39 项端到端，mock KV/队列/AI/fetch 全链路）。原文均在 §6（§6 代码块为 v4.0 上线时快照，后续版本以 `src/` 实际文件为准）。
 
 ---
 
@@ -206,7 +209,7 @@ index.js（1699 行）
 | 原债务 | 处置 |
 |---|---|
 | 单文件 885 行无分区 | 15 区结构化（§3），行内注释即地图 |
-| 无任何自动化测试 | `smoke-v4.mjs`（17 项）+ `e2e-v4.mjs`（39 项），mock 全链路，部署前必跑 |
+| 无任何自动化测试 | `smoke-v4.mjs`（100 项）+ `e2e-v4.mjs`（39 项），mock 全链路，部署前必跑 |
 | time 单位混用 | `toMs/toSec/nowSec` 显式转换，注释禁令「裸写 *1000」 |
 | 模型链写死 if/else | `buildChain` 声明式数组 `[{name, attempts, call}]`，attempts 之和对应预算配额 |
 | 无预算可见性 | `createBudget/createNet` 全网关记账，BUDGET_PLAN 静态表 + 运行时明细，单测断言 `PLAN_PEAK ≤ 50` |
@@ -220,19 +223,19 @@ index.js（1699 行）
 1. **Qwen3-30B 空 content**：Cloudflare 侧实例问题，代码已容错（重试+降级），但无 key 路径下每班仍浪费 ~8 秒在两次空尝试上。可加「连续失败 N 次后临时熔断」
 2. **llama 兜底慢**（47s）且不遵守「≤12 条」约束（靠 parseDigest 硬截断兜底）；glm-4-plus 无此问题
 3. **enrich 结果无缓存**：同 URL 重复构建会重复转换。缓存要权衡 KV 写也占子请求
-4. **`/api/diag` 无鉴权**：含实时 AI/智谱探针，任何人可打（消耗少量额度）。生产可加简单 token
-5. **DLQ 无告警**：死信消费者只 console.error，沙箱内 wrangler tail 不可用（WebSocket 被拦），死信只能靠 `/api/diag` 对照 run 记录缺失来发现。可接 Tail Worker 或邮件告警
+4. **`/api/diag` 鉴权灰度已上线**（v4.0.2.1，C5）：配置 `DIAG_KEY` secret 则 `?key=` 精确匹配，未配置则放行。**当前生产 DIAG_KEY 未设置，实际仍免鉴权**——含实时 AI/智谱探针，任何人可打（消耗少量额度）。设置后即生效（README「密钥管理」）
+5. **DLQ 告警已上线**（v4.0.2.1，D2）：consumeDlq 按班次累加计数 → consumeSend 最后分片读取，>0 且未告警过则私聊 TG_CHAT_ID（alerted 键去重）。此前死信只能靠 `/api/diag` 对照 run 记录缺失来发现
 6. **fetch 消费者挂起只能靠重试+埋点兜底**：15:14/15:25 事件（§8.4）根因未完全定位（疑调用级挂起占住并发槽位），重新部署可恢复。埋点已保证留痕；若再发，按 run:fetch 的 stage 记录定位
-7. **单文件 1699 行**：分区已缓解维护压力；wrangler 支持 ESM 多文件打包，想拆 `feeds.js`/`parsers.js`/`digest.js`/`telegram.js`/`render.js` 随时可做（测试文件按模块路径引用即可，改动小）
-8. **`/api/build` 同窗口重复调用会读到旧分片**（见 §4.2 最后一条）：如觉得不妥，可在分片记录里加 `enqueuedAt` 让 digest 校验新鲜度，成本约 1 次 KV 写
+7. **单文件 2386 行**：分区已缓解维护压力；wrangler 支持 ESM 多文件打包，想拆 `feeds.js`/`parsers.js`/`digest.js`/`telegram.js`/`render.js` 随时可做（测试文件按模块路径引用即可，改动小）
+8. **`/api/build` 同窗口重复调用会读到旧分片**（见 §4.2 最后一条）：v4.0.2.1 已加 B3 新鲜度防线（分片 at 早于消息入队 10 分钟以上判过期，宁可重试不误用），残余窗口为 10 分钟内的极端情况
 
 ---
 
 ## 6. 全部在用代码
 
-以下代码为线上运行版本原文（2026-10-25 15:38 部署，Version ID `bfce87d9-ae8f-4285-9c26-14cc5639510d`），逐字粘贴，未做任何删改。
+以下代码为 **v4.0 上线时快照**（2026-10-25 15:38 部署，Version ID `bfce87d9-ae8f-4285-9c26-14cc5639510d`），逐字粘贴，未做任何删改——保留它是为了「从零重建」时有完整可抄的底版。**当前线上为 v4.0.2.1（2386 行），以 `src/index.js` 实际文件为准**；本节的 §1-§15 分区图仍然有效。
 
-### 6.1 `index.js` —— Cloudflare Worker 主体（1699 行）
+### 6.1 `index.js` —— Cloudflare Worker 主体（快照 1699 行；当前线上 2386 行）
 
 ```js
 // ============================================================
@@ -2031,7 +2034,7 @@ crons = ["40,50 21 * * *", "0 22 * * *", "40,50 13 * * *", "0 14 * * *"]
 }
 ```
 
-### 6.4 `smoke-v4.mjs` —— 冒烟测试（17 项：纯函数 + 记账 + 容错解析）
+### 6.4 `smoke-v4.mjs` —— 冒烟测试（v4.0 快照 17 项；当前线上 100 项，以 `src/smoke-v4.mjs` 为准）
 
 ```js
 // v4 冒烟测试：纯函数 + 记账 + 消费者逻辑（mock KV/队列）
@@ -2338,7 +2341,7 @@ npx wrangler queues create guji-dlq
 
 # ② 语法预检 + 测试全家桶（必须全绿）
 node --check index.js
-node smoke-v4.mjs        # 17 项
+node smoke-v4.mjs        # 100 项
 node e2e-v4.mjs          # 39 项
 
 # ③ 部署

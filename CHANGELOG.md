@@ -39,7 +39,7 @@
 - 5 队列就位（guji-retry id 37549f1c…）→ `/api/diag` 200（items 149 / digest 9）→
   guji-digest 队列级 `delivery_delay=90` 未受部署影响（B4 运维项本轮已核实）
 
-## v4.0.2 · 2026-10-26 凌晨 · 精选环节五项改进 + 审查链收尾（当前线上）
+## v4.0.2 · 2026-10-26 凌晨 · 精选环节五项改进 + 审查链收尾
 
 > 来源：外部调研 PR #4 精选专项（作者立场见 `docs/外部AI调研_作者复核.md`）+
 > 外部审查 PR #1 剩余认同项（B2/C5/C6/D2，立场见 `docs/外部AI审查_作者复核.md`）。
@@ -92,6 +92,49 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
   27 文件一致（DEVLOG §4.6.6 有完整记录）
 - **新 digest 路径未手动触发**（会砍掉 05:50 定时班 fresh 窗口，DEVLOG §4.6.5），
   留给 05:40-06:00 无人值守首班自然验收
+
+## v4.0.2.1 · 2026-10-26 凌晨 · 运维加固批次（当前线上）
+
+> 来源：ROADMAP 剩余项中「不改核心路径、当晚可闭环」的五项（C5/D2/B3/D3/D4）。
+> 叙事见 DEVLOG §4.7。
+
+**新增**
+- **C5 diag 端点鉴权灰度**（`diagAuthorized`）：诊断端点暴露源健康度与预算消耗，
+  不适宜公开。灰度策略——配置 `DIAG_KEY` secret 则 `?key=` 精确匹配，未配置则放行。
+  代码先上、secret 后置：一经设置即生效，无需再部署（设置方法见 README「密钥管理」）
+- **D2 DLQ 告警链路**：consumeDlq 按班次累加 KV 死信计数（`guji:v4:dlqcount:{window}`），
+  consumeSend 最后分片（班次结束点）读取，>0 且未告警过则私聊 TG_CHAT_ID 推送；
+  alerted 键（`guji:v4:dlqalerted:{window}`）去重，try/catch 包裹不阻断主流程
+- **B3 分片新鲜度防线**（`isStaleShard`）：digest 消费者等待分片时，分片 at 早于
+  digest 消息入队时刻 10 分钟以上 → 判定未就绪继续等（digest 消息体新增 `at` 字段）。
+  宁可重试/进 DLQ，不误用上一班旧分片；超时时区分为 `shard-stale-timeout` /
+  `shard-wait-timeout` 两种 stage
+- **D3 GitHub Actions 每日健康巡检**（`.github/workflows/health.yml`）：每天 UTC 22:30
+  （北京 06:30，早班推送后）跑 smoke + e2e + `/api/diag` HTTP 检查，digestErr 非空
+  或非 200 即失败，自动开/跟进带 health 标签的 issue（需 repo secret `DIAG_KEY`）
+- **D4 源健康度聚合**（`aggregateHealth`）：`?health=1` 按需聚合近 3 天 run 记录。
+  seen = 该源所在分片的**全部班次**（成功+失败都算参跑——分片级失败时无法知道
+  单个源是否无辜，按「该班次没覆盖到」记失败，rate 因此偏保守）；
+  分片整体失败退化为该片全源各记一次失败；rate 不除零。consumeFetch markRun 补
+  `failedSources` 明细（原先只记数量，diag 无法回答「哪个源在失败」）
+
+**新增测试**
+- smoke 79 → 100 项：diagAuthorized 5（灰度放行/正确/错误/缺失/无文案）、
+  renderDlqAlert 2、isStaleShard 5（1 分钟新鲜/11 分钟过期/晚于入队新鲜/
+  缺 at 不校验/消息缺 at 不校验）、aggregateHealth 6、pastWindow 3（跨月边界）；
+  合计 **100 项**全绿（e2e 39 不变）
+
+**验证**
+- 100 项测试全绿 → 部署版本 **c739fd45**（9a75bc1）
+- `/api/diag` 200（items 149 / digest 9 / digestErr 空）→ 页面 200 →
+  `?key=wrong` 灰度放行 200（DIAG_KEY 未配置时的预期行为）→
+  `?health=1` 聚合 200（近 3 天 24 次 KV 读、shardRuns=4）
+- guji-digest 队列级 `delivery_delay=90` 未受部署影响
+- **部署未触发任何班次**（北京 10-26 02:1x，距最近 cron 三个半小时）：
+  新代码首班留给 05:40 am 班自然验收（延续 v4.0.2「不手动触发 digest」纪律）；
+  D2 DLQ 告警链路未触发（无死信），行为由 smoke 测试锁定
+- `?health=1` 显示 shardRuns=4——全部来自 10-25 pm 班 4 分片；更早班次由 v3 跑
+  （run 记录体系 v4 才引入），属预期；D4 基线从 10-26 am 班起逐班积累
 
 ## v4.0 · 2026-10-25 · 队列化架构上线
 
