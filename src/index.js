@@ -148,6 +148,25 @@ const FEEDS = [
 // 抓取分片总数：从 FEEDS 推导，勿手改（39 源 → 4 片）
 const SHARD_COUNT = Math.ceil(FEEDS.length / SHARD_SIZE);
 
+// ---------------- 字段长度与批量上限（v4.0.2，外部审查 C6：魔法数字入 config） ----------------
+// 项目对子请求预算有严格记账纪律，同类纪律延伸到截断长度——所有「拍死的数字」
+// 在此命名，改动只改一处。分组按使用位置。
+const PARSE_ITEMS_MAX = 40;    // 单 feed 最多解析条目（防高产量媒体刷屏的第一道闸）
+const EDGAR_ENTRIES_MAX = 8;   // EDGAR atom 最多解析 entry（count=10 的响应取 8）
+const EDGAR_ITEMS_MAX = 2;     // 单条 EDGAR entry 最多提取的 Item 事项数
+const TITLE_MAX = 300;         // 条目标题截断（三处解析器统一）
+const LINK_MAX = 500;          // 链接截断
+const DESC_MAX = 600;          // 条目摘要截断（含 enrich 补全文的上限）
+const EDGAR_DESC_MAX = 300;    // EDGAR desc 单独上限（ filings 摘要更长，控制 token）
+const DIGEST_TITLE_MAX = 120;  // 精选标题截断（parseDigest）
+const DIGEST_SUMMARY_MAX = 200; // 精选摘要截断（parseDigest，提示词要求 50 字，留 4 倍余量）
+const DIGEST_REASON_MAX = 60;  // 精选理由截断（parseDigest）
+const PROMPT_DESC_MAX = 100;   // 提示词里每条素材的摘要片段长度（控 prompt token）
+const ERR_SNIP_MAX = 80;       // 错误信息截断（日志/失败记录防爆）
+const ERR_RECORD_MAX = 300;    // KV 错误记录体的截断（比日志宽，保留排查线索）
+const AI_TRACE_HEAD_MAX = 120; // aiTrace 里模型输出头部预览长度（诊断「模型回了什么」）
+const RUN_TTL = 2 * 86400;     // run/分片 KV 记录的 TTL（秒）——覆盖下一班同 window 键前的保洁
+
 // ---------------- 抓取参数 ----------------
 const UA_CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 export const UA_SEC = 'GUJI AI Digest guji-digest@example.com'; // SEC EDGAR 要求 UA 含联系邮箱
@@ -314,6 +333,57 @@ const pickDate = (...nodes) => {
 // §5 parsers · 源数据解析（纯函数）
 // ============================================================
 
+// ---- 公共构造（v4.0.2，外部审查 C5：重复构造提 helper） ----
+
+/**
+ * 统一条目构造。原本 parseXmlFeed / parseEdgar / fetchAnthropic 三处各写一遍
+ * 「source/srcId/cat/kind/win/filter 六字段透传 + title/link/desc 截断」——
+ * 提为一处定义：新增条目字段时只改这里，不会漏改某个解析器（漏改的条目
+ * 会缺字段流到下游，是最难查的一类 bug）。
+ * @param {object} source  源定义（FEEDS 元素）
+ * @param {object} f       { title, link, ts, desc }
+ * @param {number} descMax desc 截断上限（EDGAR 传 EDGAR_DESC_MAX，其余默认 DESC_MAX）
+ */
+export function mkItem(source, f, descMax = DESC_MAX) {
+  return {
+    title: String(f.title || '').slice(0, TITLE_MAX),
+    link: String(f.link || '').slice(0, LINK_MAX),
+    ts: f.ts || 0,
+    desc: String(f.desc || '').slice(0, descMax),
+    source: source.name, srcId: source.id, cat: source.cat, kind: source.kind,
+    win: source.win, filter: source.filter,
+  };
+}
+
+/**
+ * 埋点写入。「kvPut + JSON.stringify + TTL + .catch(()=>{})」模式原在 9 处
+ * 重复（4 个消费者 + pushTelegram + 补推 + 失败留痕），提为一处：
+ *   - 埋点失败绝不影响主流程（诊断是旁路不是业务），catch 吞掉的语义在此写明；
+ *   - TTL 与键格式只有一处定义，不会出现「某个消费者忘了设 TTL」。
+ * @param {object} net    createNet() 出口
+ * @param {string} window 班次标识
+ * @param {string} stage  run 记录子键（如 'fetch:0' / 'push'）
+ * @param {*} data       记录体（会被 JSON.stringify）
+ * @param {string} label 预算记账标签（默认 run:{stage}）
+ */
+async function markRun(net, window, stage, data, label) {
+  await net.kvPut(runKey(window, stage), JSON.stringify(data),
+    { expirationTtl: RUN_TTL }, label || `run:${stage}`).catch(() => {});
+}
+
+/**
+ * 均切 n 片。pushTelegram 与 consumeSend 原本各写一遍
+ * 「Math.ceil(len/n) + slice(s*K,(s+1)*K)」，提为一处。
+ * 前 n-1 片等大，末片承接余数（余数为 0 时末片为空数组——调用方需处理空片）。
+ * @param {Array} arr 有序数组（顺序保持）
+ * @param {number} n  片数
+ * @returns {Array<Array>} n 个切片
+ */
+export function sliceChunks(arr, n) {
+  const K = Math.ceil(arr.length / n);
+  return Array.from({ length: n }, (_, s) => arr.slice(s * K, (s + 1) * K));
+}
+
 // RSS / Atom / RDF 通用解析（fast-xml-parser，自动处理 CDATA 与实体）
 export function parseXmlFeed(xml, source) {
   let items = [];
@@ -326,21 +396,14 @@ export function parseXmlFeed(xml, source) {
     else if (doc.item) items = doc.item;
   } catch (e) { return []; }
   const out = [];
-  for (const it of (Array.isArray(items) ? items : []).slice(0, 40)) {
+  for (const it of (Array.isArray(items) ? items : []).slice(0, PARSE_ITEMS_MAX)) {
     if (!it || typeof it !== 'object') continue;
     const title = stripTags(pickText(it.title));
     if (!title) continue;
     const link = pickLink(it.link) || pickText(it.id) || pickText(it.guid) || source.url;
     const ts = pickDate(it.pubDate, it.published, it.updated, it['dc:date'], it.date);
     const desc = stripTags(pickText(it.description) || pickText(it.summary) || pickText(it['content:encoded']) || pickText(it.content));
-    out.push({
-      title: title.slice(0, 300),
-      link: String(link).slice(0, 500),
-      ts,
-      desc: desc.slice(0, 600),
-      source: source.name, srcId: source.id, cat: source.cat, kind: source.kind,
-      win: source.win, filter: source.filter
-    });
+    out.push(mkItem(source, { title, link, ts, desc }));
   }
   return out;
 }
@@ -353,23 +416,16 @@ export function parseEdgar(xml, source) {
     entries = doc.feed?.entry || [];
   } catch (e) { return []; }
   const out = [];
-  for (const e of (Array.isArray(entries) ? entries : []).slice(0, 8)) {
+  for (const e of (Array.isArray(entries) ? entries : []).slice(0, EDGAR_ENTRIES_MAX)) {
     if (!e || typeof e !== 'object') continue;
     const link = pickLink(e.link);
     const ts = pickDate(e.updated, e.published);
     const summary = pickText(e.summary) || pickText(e.content);
     const items = [...summary.matchAll(/Item\s+[\d.]+:\s*([^<]+)/g)].map(m => m[1].trim()).filter(Boolean);
-    const itemText = items.slice(0, 2).join(' · ');
+    const itemText = items.slice(0, EDGAR_ITEMS_MAX).join(' · ');
     const ftype = source.type === '13F-HR' ? '13F 持仓' : source.type + ' 事件';
     const title = itemText ? `${source.name} · ${ftype}：${itemText}` : `${source.name} · ${ftype}`;
-    out.push({
-      title: title.slice(0, 300),
-      link: String(link).slice(0, 500),
-      ts,
-      desc: stripTags(summary).slice(0, 300),
-      source: source.name, srcId: source.id, cat: source.cat, kind: source.kind,
-      win: source.win, filter: source.filter
-    });
+    out.push(mkItem(source, { title, link, ts, desc: stripTags(summary) }, EDGAR_DESC_MAX));
   }
   return out;
 }
@@ -535,6 +591,14 @@ export function createNet(env, budget) {
       return ai.toMarkdown(files);
     },
 
+    /** Workers AI 批量 embedding（计 1 个子请求）。v4.0.2 事件聚类用（调研 P1-⑤）。
+     *  bge-m3 批量 input：texts 数组一次调用，避免逐条烧子请求。 */
+    async aiEmbed(texts, label = '') {
+      budget.spend(1, 'ai', label || 'embed');
+      if (!ai) throw new Error('AI 绑定缺失');
+      return ai.run(EMBED_MODEL, { text: texts });
+    },
+
     /**
      * 队列发送（保守计 1 个子请求；Cloudflare 未明确队列发送是否计入
      * 50 上限，按计入估——cron 入队班最多 4 条，两种口径下都安全）。
@@ -543,6 +607,20 @@ export function createNet(env, budget) {
       if (!binding) throw new Error('队列绑定缺失: ' + (label || '?'));
       budget.spend(1, 'queue', label || 'queue:send');
       return binding.send(body);
+    },
+
+    /**
+     * 队列批量发送（保守计 1 个子请求——同一次 sendBatch 调用）。
+     * v4.0.2 起用于入队路径（外部审查 B2）：fetch 4 片 / send 3 片从
+     * N 次调用合并为 1 次，cron 班子请求 5 → 2（digest 单独发）。
+     * @param {object} binding 队列 binding
+     * @param {object[]} bodies 消息体数组（保持顺序）
+     */
+    async qSendBatch(binding, bodies, label = '') {
+      if (!binding) throw new Error('队列绑定缺失: ' + (label || '?'));
+      if (!bodies || !bodies.length) return;
+      budget.spend(1, 'queue', label || 'queue:sendBatch');
+      return binding.sendBatch(bodies);
     },
 
     /** 是否已绑定 KV（供调用方做短路判断，避免无谓的分支） */
@@ -594,7 +672,7 @@ async function fetchFeedOne(f, net, failures) {
     console.error(`✓ ${f.id}: ${xml.length}B → ${parsed.length} 条`);
     return parsed;
   } catch (e) {
-    const err = String(e && e.message || e).slice(0, 80);
+    const err = String(e && e.message || e).slice(0, ERR_SNIP_MAX);
     failures.push({ name: f.name, err });
     console.error(`✗ ${f.id}: ${err}`);
     return [];
@@ -640,13 +718,12 @@ export async function fetchAnthropic(source, net) {
     seen.add(slug);
     if (seenMap[slug]) continue; // 之前已推送过，跳过
     newSeen[slug] = nowSecValue;
-    out.push({
-      title: `Anthropic：${title}`.slice(0, 300),
+    out.push(mkItem(source, {
+      title: `Anthropic：${title}`,
       link: 'https://www.anthropic.com/news/' + slug,
       ts: Date.now(), // 无日期，按“新出现”算
-      desc: '', source: source.name, srcId: source.id, cat: source.cat, kind: source.kind,
-      win: source.win, filter: source.filter
-    });
+      desc: '',
+    }));
   }
   // 一次性写回去重集合，并清理 60 天前的记录（避免无限膨胀）
   if (Object.keys(newSeen).length) {
@@ -769,6 +846,26 @@ const MATERIAL_MAX = 24;
 /** 精选条数硬上限（与提示词「不超过 12 条」对齐） */
 export const DIGEST_MAX = 12;
 
+/**
+ * 事件聚类 embedding 模型（v4.0.2，调研 P1-⑤ 限定采纳）。
+ * bge-m3：Workers AI 免费档可用，768 维，批量 input 一次调用 = 1 子请求。
+ * 聚类发生在 material 层（≤24 条），同事件多源只留代表进模型——
+ * 既省 token 又防「同一事件 N 条重复上日报」。
+ */
+export const EMBED_MODEL = '@cf/baai/bge-m3';
+/** 合并阈值：cosine ≥ 0.85（复核二限定从严，不用调研建议的 0.8） */
+export const CLUSTER_SIMILARITY = 0.85;
+/** 时间门限：超过 48h 不判同事件（防止「每年都发布」的系列事件误合并） */
+export const CLUSTER_WINDOW_H = 48;
+
+/**
+ * 精选模型温度（v4.0.2，调研 P0-④，作者复核采纳）。
+ * 0.3 → 0.1：低温降编造是机制性共识——精选是「从原文挑+概括」的任务，
+ * 要的是稳和忠实，不是多样性。只求稳，不宣称具体收益。
+ * 智谱 glm-4-plus 与 CF 侧模型共用此值（两处调用一致，避免「换模型行为漂移」）。
+ */
+export const DIGEST_TEMPERATURE = 0.1;
+
 // ---------------- AI 调用 ----------------
 
 async function runAI(net, model, payload) {
@@ -795,10 +892,40 @@ export function aiText(res) {
 // ---------------- 容错解析 ----------------
 
 /**
+ * rubric 四维自报分归一化（v4.0.2，调研 P0-①，作者复核「方向采纳，实施单独立批」）。
+ * 四维：影响面 impact / 信息密度 density / 来源权威 authority / 时效性 timeliness。
+ * 容忍畸形输入（字符串 / 缺维 / 超范围 / 整个缺失），一律夹到 1-10；
+ * 无法解析的维给中性 5——**自报分只排序不设阈值**（LLM 自报分数过度自信，
+ * 文献有充分支撑，因此不用绝对值筛条目；无分条目只是排在打分校之后，不淘汰）。
+ * @param {*} s 模型输出的 scores 对象（或旧格式缺省）
+ * @returns {{impact:number,density:number,authority:number,timeliness:number,total:number}}
+ */
+function normScore(s) {
+  const src = (s && typeof s === 'object' && !Array.isArray(s)) ? s : {};
+  const dims = ['impact', 'density', 'authority', 'timeliness'];
+  const o = {};
+  let total = 0;
+  for (const k of dims) {
+    const v = Number(src[k]);
+    o[k] = Number.isFinite(v) && v > 0 ? Math.min(10, Math.max(1, Math.round(v))) : 5;
+    total += o[k];
+  }
+  o.total = total;
+  return o;
+}
+
+/**
  * 解析模型输出。容错链：整体 JSON → 截取数组段 → 逐对象提取
  * （抗截断 / ```json 包裹 / 前言废话）。
  * @param {string} text     模型原始输出
  * @param {object[]} material 素材（idx 从 1 开始对应 material[0]）
+ *
+ * v4.0.2（调研 P0-①）：输出契约扩展为 {idx, reason, scores{四维}, title, summary}。
+ * 旧格式（无 reason/scores）完全兼容——normScore 给中性分参与排序。
+ * 收集全部条目后**按四维总分降序**再截 DIGEST_MAX（原来是按模型输出顺序截断）：
+ * 日报呈现顺序从此是「模型自评的重要性」而非「模型列举顺序」。
+ * parseDigest 三级容错同步扩展（作者复核的前置条件）：分数畸形不抛错，
+ * 走 normScore 归一化路径。
  */
 export function parseDigest(text, material) {
   let arr = null;
@@ -826,12 +953,16 @@ export function parseDigest(text, material) {
     seen.add(idx);
     const it = material[idx - 1];
     out.push({
-      cat: it.cat, title: title.slice(0, 120), summary: summary.slice(0, 200),
-      source: it.source, link: it.link, ts: it.ts
+      cat: it.cat, title: title.slice(0, DIGEST_TITLE_MAX), summary: summary.slice(0, DIGEST_SUMMARY_MAX),
+      source: it.source, link: it.link, ts: it.ts,
+      reason: String(d.reason || '').slice(0, DIGEST_REASON_MAX), // v4.0.2 rubric：一句话理由（可缺）
+      score: normScore(d.scores || d.score),            // v4.0.2 rubric：四维自报分（可缺 → 中性）
     });
-    if (out.length >= DIGEST_MAX) break; // 模型不守约时硬截断
   }
-  return out;
+  // v4.0.2（调研 P0-①）：按总分降序（同分保持模型输出顺序——sort 稳定），
+  // 再截硬上限。「模型不守约时硬截断」的语义不变，只是截断依据从顺序变为分数。
+  out.sort((a, b) => b.score.total - a.score.total);
+  return out.slice(0, DIGEST_MAX);
 }
 
 // ---------------- 薄摘要补全文 ----------------
@@ -847,7 +978,7 @@ async function enrichMaterial(material, net) {
   for (const it of targets) { // 串行：峰值内存可控（并行大页面易触发 Worker 资源上限 1102）
     try {
       const md = net.env && net.env.JINA_KEY ? await fetchViaJina(it.link, net) : await fetchViaToMarkdown(it.link, net);
-      if (md && md.length > (it.desc || '').length + 40) it.desc = md.slice(0, 600); // 确实更丰富才采用
+      if (md && md.length > (it.desc || '').length + 40) it.desc = md.slice(0, DESC_MAX); // 确实更丰富才采用
     } catch (e) { /* 静默：保留原摘要 */ }
   }
   return material;
@@ -862,7 +993,7 @@ async function fetchViaJina(url, net) {
       headers: { 'Accept': 'text/plain', 'Authorization': 'Bearer ' + net.env.JINA_KEY }
     }, 'enrich:jina');
     if (!r.ok) return null;
-    return cleanMd(await r.text()).slice(0, 600);
+    return cleanMd(await r.text()).slice(0, DESC_MAX);
   } finally { clearTimeout(timer); }
 }
 
@@ -890,10 +1021,187 @@ async function fetchViaToMarkdown(url, net) {
   const results = await Promise.race([call, timeout]);
   const res = results && results[0];
   if (!res) throw new Error('toMarkdown 超时');
-  if (res.format === 'error') throw new Error('toMarkdown: ' + String(res.error).slice(0, 80));
+  if (res.format === 'error') throw new Error('toMarkdown: ' + String(res.error).slice(0, ERR_SNIP_MAX));
   let md = String(res.data || '');
   md = md.replace(/^---\n[\s\S]*?\n---\n*/, ''); // 去 YAML frontmatter
-  return cleanMd(md).slice(0, 600);
+  return cleanMd(md).slice(0, DESC_MAX);
+}
+
+// ---------------- 精选忠实度校验 ----------------
+// v4.0.2 新增（调研 P0-③，作者复核「全清单性价比之王」）：零 token 成本，
+// 代码级拦截「数字/型号编造」——直接服务「一手来源不编造」的立身之本。
+
+/** 数量级单位归一化因子：摘要「35 亿」与原文「$3.5 billion」应判相等（都是 3.5e9） */
+const QUANT_UNIT = { '%': 1, percent: 1, billion: 1e9, bn: 1e9, b: 1e9, million: 1e6, mn: 1e6, m: 1e6, 万亿: 1e12, 亿: 1e8, 万: 1e4, k: 1e3 };
+
+/** 从文本抽取可比数量集合：带单位数字归一化为绝对值；无单位的小数点数字取原值 */
+function extractQuantities(text) {
+  const out = new Set();
+  const re = /(\d+(?:\.\d+)?)\s*(%|percent|billion|million|bn|mn|[bmk]|万亿|亿|万)?/gi;
+  let m;
+  while ((m = re.exec(String(text || '')))) {
+    const v = parseFloat(m[1]);
+    if (!Number.isFinite(v)) continue;
+    if (m[2]) out.add(v * (QUANT_UNIT[m[2].toLowerCase()] ?? 1));
+    else if (m[0].indexOf('.') >= 0) out.add(v); // 纯整数不校验：见下方裁量说明
+  }
+  return out;
+}
+
+/** 从文本抽取消型号/版本模式（GPT-5、H100、RTX-4090、v1.2） */
+function extractModelTokens(text) {
+  const out = new Set();
+  const re = /\b([A-Za-z][A-Za-z0-9]{0,14}[-–]?\d[\d.]*[A-Za-z0-9]*)\b/g;
+  let m;
+  while ((m = re.exec(String(text || '')))) out.add(m[1].toLowerCase().replace(/[-–\s.]/g, ''));
+  return out;
+}
+
+/**
+ * 校验一条精选摘要对原文的忠实度。
+ * @param {string} summary 模型写的中文摘要
+ * @param {string} source  原文（标题 + 摘要）
+ * @returns {string[]} 问题列表（空 = 通过）
+ *
+ * 裁量说明（有意收窄，防误杀）：
+ *   - **纯整数不校验**：「3.5 billion → 35 亿」这类合理翻译若按字符串比对会误杀；
+ *     只校验带单位数字（归一化绝对值后比对）和小数点数字。
+ *   - **纯字母产品名不校验**：中文音译（Google/谷歌、Nvidia/英伟达）差异会误杀；
+ *     型号模式（字母+数字）才是编造高发且低误杀区。
+ *   - 宁可漏判（放过编造）也不错杀（丢掉合理精选）——漏判有 aiTrace 可观测，
+ *     错杀直接让读者少看一条。失败条目由调用方剔除并记 trace。
+ */
+export function checkFaithful(summary, source) {
+  const bad = [];
+  const src = String(source || '');
+  const sum = String(summary || '');
+  if (!sum || !src) return bad;
+  const srcQ = extractQuantities(src);
+  for (const v of extractQuantities(sum)) {
+    if (!srcQ.has(v)) bad.push(`数字（归一化值 ${v}）原文未找到`);
+  }
+  const srcM = extractModelTokens(src);
+  for (const t of extractModelTokens(sum)) {
+    if (t.length >= 3 && !srcM.has(t)) bad.push(`型号 ${t} 原文未找到`);
+  }
+  return bad;
+}
+
+/**
+ * 按忠实度过滤精选结果（v4.0.2，调研 P0-③ 的落点）。
+ * 失败条目剔除 + 返回 rejected 供 trace 留痕——「打回重写」的零成本轻量版：
+ * 不额外花模型调用，剔除后若 kept 为空则该次 attempt 无产出，模型链自然
+ * 换模型/重试（makeDigest 已有 attempts 机制）。
+ * @param {object[]} digest   parseDigest 的输出
+ * @param {object[]} material 素材（按 digest[i].link 匹配回原文）
+ * @returns {{kept: object[], rejected: object[]}}
+ */
+export function filterFaithful(digest, material) {
+  const kept = [];
+  const rejected = [];
+  for (const d of digest || []) {
+    const it = material.find(x => x.link === d.link) || {};
+    const bad = checkFaithful(d.summary, `${it.title || ''} ${it.desc || ''}`);
+    if (bad.length) rejected.push({ title: d.title, bad });
+    else kept.push(d);
+  }
+  return { kept, rejected };
+}
+
+// ---------------- 事件聚类去重（v4.0.2，调研 P1-⑤ 限定采纳） ----------------
+
+/** 余弦相似度（embedding 向量）。长度不一致或空向量返回 0。 */
+export function cosineSim(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || !a.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/**
+ * 事件聚类（纯函数）：相似条目分组，供「同事件多源只留代表」。
+ * 规则（全部按复核二限定条件，一条不放宽）：
+ *   - cosine ≥ CLUSTER_SIMILARITY（0.85，从严；不用调研建议的 0.8）
+ *   - 时间差 ≤ CLUSTER_WINDOW_H（48h）——防止「每年都发布」的系列事件误合并
+ *   - **拿不准不合并**：低于阈值一律不合；0.80-0.85 的「接近对」收进 near，
+ *     由调用方记 aiTrace 供人工抽查（复核二把调研的「拿不准就合并」倒转过来）
+ *   - ts=0（无日期）的条目无法判断同时性，从严不参与聚类
+ * 算法：O(n²) 暴力对（material ≤24，复核原文「160² 无压力」）+ 并查集。
+ *   并查集传递性说明：A~B 且 B~C 但 A!~C 仍同簇——事件传播链上表述渐变
+ *   是常态，同簇取代表不影响正确性（保留的是最新源）。
+ * @param {object[]} items       条目（需 ts 字段）
+ * @param {number[][]} embeddings 与 items 等长的 embedding 矩阵（可含 null）
+ * @returns {{clusters: number[][], near: object[]}} 簇（items 下标组）+ 接近对
+ */
+export function clusterItems(items, embeddings) {
+  const n = items.length;
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const near = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (!embeddings[i] || !embeddings[j]) continue;
+      if (!items[i].ts || !items[j].ts) continue; // 无日期：无法判断同时性，从严
+      if (Math.abs(toSec(items[i].ts) - toSec(items[j].ts)) > CLUSTER_WINDOW_H * 3600) continue;
+      const sim = cosineSim(embeddings[i], embeddings[j]);
+      if (sim >= CLUSTER_SIMILARITY) parent[find(i)] = find(j);
+      else if (sim >= CLUSTER_SIMILARITY - 0.05) near.push({ a: items[i].title, b: items[j].title, sim: Math.round(sim * 1000) / 1000 });
+    }
+  }
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(i);
+  }
+  return { clusters: [...groups.values()], near };
+}
+
+/**
+ * material 事件聚类落地（v4.0.2，调研 P1-⑤）：
+ * 批量 embedding（1 子请求）→ clusterItems → 同簇保留 ts 最新的条目为代表，
+ * 其余成员的来源名拼进代表 desc 尾部（「另 N 个源报道同一事件」）——模型仍看得到
+ * 多源信号，日报条目不重复。**任何一步失败都整体跳聚类**（记 trace），
+ * 宁可不聚类，不可阻断日报（聚类是优化不是必需）。
+ * @returns {Promise<object[]>} 聚类后的 material（可能原样返回）
+ */
+async function clusterMaterial(material, net, trace) {
+  if (material.length < 2) return material;
+  let embeds = null;
+  try {
+    const texts = material.map(it => `${it.title} ${(it.desc || '').slice(0, 200)}`);
+    const res = await net.aiEmbed(texts, 'cluster:embed');
+    const data = res && res.data;
+    if (Array.isArray(data) && data.length === material.length) embeds = data.map(d => d && d.embedding);
+  } catch (e) {
+    trace.push({ stage: 'cluster', err: String(e && e.message).slice(0, ERR_RECORD_MAX) });
+    console.error(`cluster: embedding 失败，跳过去重（${e && e.message}）`);
+    return material;
+  }
+  if (!embeds) return material;
+  const { clusters, near } = clusterItems(material, embeds);
+  if (near.length) {
+    trace.push({ stage: 'cluster', near, note: '0.80-0.85 接近对，拿不准不合并（复核二限定）' });
+    console.error(`cluster: ${near.length} 对接近阈值未合并（已记 aiTrace 供抽查）`);
+  }
+  const out = [];
+  let merged = 0;
+  for (const group of clusters) {
+    if (group.length === 1) { out.push(material[group[0]]); continue; }
+    const sorted = [...group].sort((a, b) => (material[b].ts || 0) - (material[a].ts || 0)); // 代表 = ts 最新
+    const rep = { ...material[sorted[0]] };
+    const others = [...new Set(sorted.slice(1).map(i => material[i].source).filter(Boolean))];
+    if (others.length) rep.desc = `${rep.desc || ''}\n（另 ${others.length} 个源报道同一事件：${others.join('、')}）`.slice(0, DESC_MAX);
+    out.push(rep);
+    merged += sorted.length - 1;
+  }
+  if (merged) {
+    const dupGroups = clusters.filter(g => g.length > 1).map(g => g.map(i => material[i].title));
+    trace.push({ stage: 'cluster', merged, groups: dupGroups });
+    console.error(`cluster: ${merged} 条同事件条目已合并为 ${dupGroups.length} 簇`);
+  }
+  return out;
 }
 
 // ---------------- 提示词 ----------------
@@ -904,18 +1212,31 @@ async function fetchViaToMarkdown(url, net) {
  *    Qwen3 关思考的「开关」，实测三重全失效（Qwen3 会把 max_tokens 耗在 reasoning 上，
  *    返回空 content，曾导致精选恒为 0 条）。最终解是换 GLM-4-plus（无思考模式）。
  *    两个参数对 GLM 无害故保留，但**不再宣称有效**——v4.0.1 注释修正（外部审查 C3）。
+ *
+ * v4.0.2（调研 P0-①②）：两步流程的「第一步」从笼统的「挑重要的」升级为
+ * **四维 rubric 打分**（先理由后分数——思维链引导，降低乱打）：
+ *   影响面 impact / 信息密度 density / 来源权威 authority / 时效性 timeliness。
+ *   分数只用于代码排序（parseDigest 按总分降序取 DIGEST_MAX），**不设阈值**——
+ *   自报分过度自信有文献支撑，绝对值不可信，相对排序可用。
+ *   同时新增【硬约束】段（P0-②）：产品名/数字原文可找、宁省略不补全、
+ *   相对时间照抄、不强化语气、排他性表述仅原文明示才保留。
  */
 export function buildPrompt(material) {
   const list = material.map((it, i) =>
-    `${i + 1}. [${it.cat}] ${it.title}（来源：${it.source}）${it.desc ? ' 摘要：' + it.desc.slice(0, 100) : ''}`
+    `${i + 1}. [${it.cat}] ${it.title}（来源：${it.source}）${it.desc ? ' 摘要：' + it.desc.slice(0, PROMPT_DESC_MAX) : ''}`
   ).join('\n');
   return `<arg_key:opensource>
 你是「GUJI AI 情报日报」的主编。下面是今天从各官方一手来源抓到的条目（编号、分类、标题、来源、摘要片段）。
 请分两步工作，不要跳步：
-第一步【整理精选】：通读全部条目，挑出真正重要、有实质信息量的（如新模型/新产品/重大财报与订单/重要论文/深度观点），总量严格不超过 ${DIGEST_MAX} 条；跳过营销通稿、人事任命、无信息量的条目。
+第一步【整理精选】：通读全部条目，挑出真正重要、有实质信息量的（如新模型/新产品/重大财报与订单/重要论文/深度观点），跳过营销通稿、人事任命、无信息量的条目，总量严格不超过 ${DIGEST_MAX} 条。对每个入选条目，先写一句话理由（reason，30 字以内，说明为什么重要），再按四个维度打 1-10 分：影响面 impact（对行业/市场的影响范围与深度）、信息密度 density（实质信息量，排除营销水分）、来源权威 authority（一手来源的权威程度）、时效性 timeliness（新鲜程度）。
 第二步【总结翻译】：只对精选出的条目，为每条写一个中文标题（25 字以内）和一句中文摘要（50 字以内）。必须基于原文信息概括，不得编造原文没有的内容，数字与名称保留原文。
+【硬约束】（v4.0.2 新增，调研 P0-②：直接压缩编造空间，违反任何一条都算失败）
+1. 摘要中出现的每个产品名、公司名、数字、版本号，都必须能在原文中逐一找到；找不到就不写——**宁省略，不补全**。
+2. 原文用相对时间（today / this week / 近日）就照抄，禁止换算成具体日期。
+3. 不强化语气：原文没说的「首次」「最强」「革命性」不许加；排他性表述（only / first-ever）仅当原文明示时才保留。
+4. 摘要只承担「这条新闻是什么」，不承担评价与推测。
 输出严格的 JSON 数组（不要 markdown 代码块标记，不要任何其他文字），每项格式：
-{"idx": 条目编号, "title": "中文标题", "summary": "中文摘要"}
+{"idx": 条目编号, "reason": "一句话理由", "scores": {"impact": 8, "density": 7, "authority": 9, "timeliness": 8}, "title": "中文标题", "summary": "中文摘要"}
 
 今日条目：
 ${list}
@@ -938,7 +1259,9 @@ export async function fetchViaZhipu(prompt, net) {
     body: JSON.stringify({
       model: 'glm-4-plus',
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 1536, temperature: 0.3
+      // max_tokens 1536 → 2048（v4.0.2，调研 P0-①）：输出契约增加 reason + 四维分数，
+      // 12 条精选的输出变长约 30%；不影响子请求计数，零成本。
+      max_tokens: 2048, temperature: DIGEST_TEMPERATURE
       })
     }, 'zhipu:glm-4-plus');
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -966,7 +1289,7 @@ export function buildChain(net, prompt) {
   //    Qwen3 关思考的「正开关」，实测无效（Qwen3 空 content 的真正解是换 GLM-4-plus）。
   //    参数对 GLM 无害故保留——v4.0.1 注释修正（外部审查 C3）。
   const cfPayload = {
-    messages: [{ role: 'user', content: prompt }], max_tokens: 3072, temperature: 0.3,
+    messages: [{ role: 'user', content: prompt }], max_tokens: 3072, temperature: DIGEST_TEMPERATURE,
     chat_template_kwargs: { enable_thinking: false },
   };
   const hasZhipu = !!(net.env && net.env.ZHIPU_KEY);
@@ -994,23 +1317,28 @@ export async function makeDigest(items, net) {
   const trace = []; // 逐模型诊断：供 /api/diag 排查「精选 0 条」
   const material = items.slice(0, MATERIAL_MAX);
   await enrichMaterial(material, net); // 薄摘要先补全文（Jina key 或原生 toMarkdown），模型看得更深
-  const prompt = buildPrompt(material);
+  const clustered = await clusterMaterial(material, net, trace); // v4.0.2 事件聚类（调研 P1-⑤；失败整体跳过）
+  const prompt = buildPrompt(clustered);
   const chain = buildChain(net, prompt);
   for (const m of chain) {
     for (let attempt = 1; attempt <= m.attempts; attempt++) {
       const t0 = Date.now();
       try {
         const text = await m.call();
-        const digest = parseDigest(text, material);
-        trace.push({ model: m.name, attempt, ms: Date.now() - t0, textLen: text.length, digest: digest.length, head: text.slice(0, 120) });
-        if (digest.length) {
-          console.error(`digest: ${m.name} → ${digest.length} 条精选`);
-          return { digest, trace };
+        // 注意用 clustered（送进 prompt 的那份）回填 idx——聚类改变了 material 组成，
+        // 用原 material 会错位（v4.0.2 聚类接入时的关键修正点）。
+        const digest = parseDigest(text, clustered);
+        const { kept, rejected } = filterFaithful(digest, clustered); // v4.0.2 忠实度校验（调研 P0-③）
+        trace.push({ model: m.name, attempt, ms: Date.now() - t0, textLen: text.length, digest: kept.length, rejected: rejected.length, head: text.slice(0, AI_TRACE_HEAD_MAX) });
+        if (kept.length) {
+          console.error(`digest: ${m.name} → ${kept.length} 条精选${rejected.length ? `（${rejected.length} 条未过忠实度校验已剔除）` : ''}`);
+          if (rejected.length) console.error(`digest 剔除明细：${rejected.map(r => `${r.title}: ${r.bad.join('; ')}`).join(' | ').slice(0, 300)}`);
+          return { digest: kept, trace };
         }
-        if (text.trim()) break; // 有输出但解析不出：换模型更有希望
+        if (text.trim()) break; // 有输出但解析不出 / 全未过校验：换模型更有希望
         if (attempt < m.attempts) await new Promise(r => setTimeout(r, 2000));
       } catch (e) {
-        trace.push({ model: m.name, attempt, ms: Date.now() - t0, err: String(e && e.message).slice(0, 200) });
+        trace.push({ model: m.name, attempt, ms: Date.now() - t0, err: String(e && e.message).slice(0, ERR_RECORD_MAX) });
         console.error(`digest: ${m.name} 失败：${e && e.message}`);
         if (attempt < m.attempts) await new Promise(r => setTimeout(r, 2000));
       }
@@ -1157,9 +1485,9 @@ export async function pushTelegram(net, data) {
   const pairs = buildPushPairs(net.env, data);
   if (!pairs.length) return [];
   const results = [];
-  const K = Math.ceil(pairs.length / SEND_SLICES);
-  for (let s = 0; s < SEND_SLICES; s++) {
-    results.push(...await sendChunk(net, pairs.slice(s * K, (s + 1) * K)));
+  for (const chunk of sliceChunks(pairs, SEND_SLICES)) {
+    if (!chunk.length) continue;
+    results.push(...await sendChunk(net, chunk));
   }
   return results;
 }
@@ -1282,10 +1610,11 @@ async function consumeFetch(batch, env) {
     const net = createNet(env, budget);
     const body = msg.body;
     const { window, shard, feeds } = body || {};
-    // 阶段记录：失败也留痕（ok:false + stage + err），供 KV 事后诊断
-    const mark = (stage, extra = {}) => net.kvPut(runKey(window, `fetch:${shard}`), JSON.stringify({
+    // 阶段记录：失败也留痕（ok:false + stage + err），供 KV 事后诊断。
+    // v4.0.2（C5）：本地 mark 箭头函数改为委托 markRun——埋点格式/TTL 一处定义。
+    const mark = (stage, extra = {}) => markRun(net, window, `fetch:${shard}`, {
       at: Date.now(), shard, stage, budget: budget.report(), ...extra
-    }), { expirationTtl: 2 * 86400 }, `run:fetch:${stage}`).catch(() => {});
+    }, `run:fetch:${stage}`);
     try {
       if (!Array.isArray(feeds) || !feeds.length) {
         await mark('empty-feeds', { ok: false, bodyType: typeof body, bodyKeys: body && typeof body === 'object' ? Object.keys(body) : null });
@@ -1296,16 +1625,16 @@ async function consumeFetch(batch, env) {
       const failures = [];
       const items = await fetchShardFeeds(feeds, net, failures);
       await mark('fetched', { ok: false, items: items.length, failures: failures.length });
-      // 写分片（2 天 TTL：覆盖下一班同 window 键前的保洁，异常键自动清扫）
+      // 写分片（RUN_TTL：覆盖下一班同 window 键前的保洁，异常键自动清扫）
       await net.kvPut(shardKey(window, shard), JSON.stringify({ items, failures, at: Date.now() }),
-        { expirationTtl: 2 * 86400 }, `shard:${shard}`);
-      await net.kvPut(runKey(window, `fetch:${shard}`), JSON.stringify({
+        { expirationTtl: RUN_TTL }, `shard:${shard}`);
+      await markRun(net, window, `fetch:${shard}`, {
         at: Date.now(), shard, ok: true, items: items.length, failures: failures.length, budget: budget.report()
-      }), { expirationTtl: 2 * 86400 }, 'run:fetch').catch(() => {});
+      }, 'run:fetch');
       msg.ack();
       console.error(`[fetch] ${window} 分片${shard}：${items.length} 条，失败 ${failures.length} 个源，预算 ${budget.total}/${budget.limit}`);
     } catch (e) {
-      await mark('error', { ok: false, err: String(e && e.message || e).slice(0, 300), errName: e && e.name });
+      await mark('error', { ok: false, err: String(e && e.message || e).slice(0, ERR_RECORD_MAX), errName: e && e.name });
       throw e;
     }
   }
@@ -1344,9 +1673,9 @@ async function consumeDigest(batch, env) {
   //    此处轮询是双保险：抓取异常慢时在调用内等，不烧队列重试次数）
   let shards = null;
   const deadline = Date.now() + SHARD_WAIT_MS;
-  const markDigest = (extra) => net.kvPut(runKey(window, 'digest'), JSON.stringify({
+  const markDigest = (extra) => markRun(net, window, 'digest', {
     at: Date.now(), ok: false, budget: budget.report(), ...extra
-  }), { expirationTtl: 2 * 86400 }, 'run:digest:err').catch(() => {});
+  }, 'run:digest:err');
   while (true) {
     const attempt = [];
     let ready = true;
@@ -1396,7 +1725,7 @@ async function consumeDigest(batch, env) {
     const r = await makeDigest(pool, net);
     digest = r && r.digest;
     aiTrace = r && r.trace;
-  } catch (e) { digestErr = String(e && e.message || e).slice(0, 200); }
+  } catch (e) { digestErr = String(e && e.message || e).slice(0, ERR_RECORD_MAX); }
   log(`精选完成：${digest ? digest.length : 0} 条${digestErr ? ' / 错误：' + digestErr : ''}`);
 
   // 5. 落库（items 总是保存；精选失败也保存，推送走英文清单兜底）
@@ -1413,14 +1742,14 @@ async function consumeDigest(batch, env) {
 
   // 6. 精选彻底失败 → 记 run + throw（消息重试；items 已落库，页面与推送有兜底）
   if (!digest || !digest.length) {
-    await net.kvPut(runKey(window, 'digest'), JSON.stringify({
+    await markRun(net, window, 'digest', {
       at: Date.now(), ok: false, digestErr, budget: budget.report()
-    }), { expirationTtl: 2 * 86400 }, 'run:digest').catch(() => {});
+    }, 'run:digest');
     throw new Error('精选失败：' + (digestErr || '模型链全部失败'));
   }
-  await net.kvPut(runKey(window, 'digest'), JSON.stringify({
+  await markRun(net, window, 'digest', {
     at: Date.now(), ok: true, digest: digest.length, budget: budget.report() // put 之后的完整账
-  }), { expirationTtl: 2 * 86400 }, 'run:digest').catch(() => {});
+  }, 'run:digest');
   msg.ack();
   log(`完成，预算 ${budget.total}/${budget.limit}`);
 }
@@ -1469,19 +1798,17 @@ async function consumeSend(batch, env) {
     msg.ack();
     return;
   }
-  const K = Math.ceil(pairs.length / slices);
-  const chunk = pairs.slice(slice * K, (slice + 1) * K);
+  // v4.0.2（C5）：与 pushTelegram 共用 sliceChunks——两处切分逻辑原本各写一遍
+  const chunk = sliceChunks(pairs, slices)[slice] || [];
   if (!chunk.length) { msg.ack(); return; }
 
   const results = await sendChunk(net, chunk);
   const okCount = results.filter(r => r.ok).length;
   const record = { at: Date.now(), slice, ok: okCount, total: results.length, budget: budget.report() };
-  await net.kvPut(runKey(window, `send:${slice}`), JSON.stringify(record),
-    { expirationTtl: 2 * 86400 }, `run:send:${slice}`).catch(() => {});
+  await markRun(net, window, `send:${slice}`, record, `run:send:${slice}`);
   // slice 0 完成即写「本班已推」标记（路由幂等守卫与 diag 用）
   if (slice === 0) {
-    await net.kvPut(runKey(window, 'push'), JSON.stringify({ at: Date.now(), ok: okCount, total: results.length }),
-      { expirationTtl: 2 * 86400 }, 'run:push').catch(() => {});
+    await markRun(net, window, 'push', { at: Date.now(), ok: okCount, total: results.length }, 'run:push');
   }
 
   // v4.0.1（外部审查 A1）：失败项分流——瞬时失败入补推队列，永久错误放弃并留痕
@@ -1515,12 +1842,12 @@ async function consumeSend(batch, env) {
       }
     }
     if (permanent) {
-      console.error(`[send] ${window} 分片${slice}：${permanent} 条永久错误（${failed.filter(r => isPermanentTgError(r.err)).map(r => r.err).join('; ').slice(0, 120)}），放弃重推`);
+      console.error(`[send] ${window} 分片${slice}：${permanent} 条永久错误（${failed.filter(r => isPermanentTgError(r.err)).map(r => r.err).join('; ').slice(0, ERR_SNIP_MAX)}），放弃重推`);
     }
-    await net.kvPut(runKey(window, `send:${slice}:failed`), JSON.stringify({
+    await markRun(net, window, `send:${slice}:failed`, {
       at: Date.now(), slice, retried: retriable.length, permanent,
-      errors: failed.map(r => ({ i: r.i, chat: r.chat, err: String(r.err).slice(0, 120) }))
-    }), { expirationTtl: 2 * 86400 }, `run:send-fail:${slice}`).catch(() => {});
+      errors: failed.map(r => ({ i: r.i, chat: r.chat, err: String(r.err).slice(0, ERR_RECORD_MAX) }))
+    }, `run:send-fail:${slice}`);
   }
   msg.ack();
   console.error(`[send] ${window} 分片${slice}：${okCount}/${results.length} 成功，预算 ${budget.total}/${budget.limit}`);
@@ -1551,9 +1878,9 @@ async function consumeRetry(batch, env) {
   const okCount = results.filter(r => r.ok).length;
   const failed = results.filter(r => !r.ok);
   const retriable = failed.filter(r => !isPermanentTgError(r.err));
-  await net.kvPut(runKey(window, `retry:${slice}`), JSON.stringify({
+  await markRun(net, window, `retry:${slice}`, {
     at: Date.now(), slice, attempts, ok: okCount, total: results.length, budget: budget.report()
-  }), { expirationTtl: 2 * 86400 }, `run:retry:${slice}`).catch(() => {});
+  }, `run:retry:${slice}`);
 
   if (!retriable.length) {
     if (failed.length) console.error(`[retry] ${window} 分片${slice} 第${attempts}轮：${failed.length} 条永久错误，放弃`);
@@ -1612,7 +1939,7 @@ async function probeAI(net) {
     }, 'diag:ai');
     return { ok: true, ms: Date.now() - t0, text: aiText(res).slice(0, 40), model: m };
   } catch (e) {
-    return { ok: false, err: String(e && e.message).slice(0, 200), model: net.env.ZHIPU_KEY ? AI_MODELS[1] : AI_MODELS[0] };
+    return { ok: false, err: String(e && e.message).slice(0, ERR_RECORD_MAX), model: net.env.ZHIPU_KEY ? AI_MODELS[1] : AI_MODELS[0] };
   }
 }
 
@@ -1623,7 +1950,7 @@ async function probeZhipu(net) {
     const text = await fetchViaZhipu('只回复两个字：正常', net);
     return { ok: true, ms: Date.now() - t0, text: text.slice(0, 40) };
   } catch (e) {
-    return { ok: false, err: String(e && e.message).slice(0, 200) };
+    return { ok: false, err: String(e && e.message).slice(0, ERR_RECORD_MAX) };
   }
 }
 
@@ -1644,10 +1971,14 @@ const LOADING_PAGE = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta nam
  * @param {string} window 班次标识
  */
 async function enqueueFetch(env, net, window) {
+  // v4.0.2（外部审查 B2）：N 次 qSend 合并为 1 次 sendBatch（cron 班子请求 5 → 2）。
+  // 分片内 feeds 随消息下发（消费者自解析），消息体形态与逐条发送完全一致。
+  const bodies = [];
   for (let n = 0; n < SHARD_COUNT; n++) {
     const feeds = FEEDS.slice(n * SHARD_SIZE, (n + 1) * SHARD_SIZE);
-    await net.qSend(env.GUJI_FETCH_Q, { kind: 'fetch', window, shard: n, feeds }, `fetch:shard${n}`);
+    bodies.push({ kind: 'fetch', window, shard: n, feeds });
   }
+  await net.qSendBatch(env.GUJI_FETCH_Q, bodies, 'fetch:batch');
 }
 
 /**
@@ -1664,9 +1995,14 @@ async function enqueueBuild(env, net, window, full) {
 
 /** 入队一次「推送」（3 个顺序分片） */
 async function enqueueSend(env, net, window, force) {
+  // v4.0.2（外部审查 B2）：3 次 qSend 合并为 1 次 sendBatch。
+  // ⚠️ 顺序语义：sendBatch 保持入队顺序，3 个分片仍按 slice 0→2 顺序被
+  //   串行消费者处理（max_concurrency=1），保序推送不受影响。
+  const bodies = [];
   for (let s = 0; s < SEND_SLICES; s++) {
-    await net.qSend(env.GUJI_SEND_Q, { kind: 'send', window, slice: s, slices: SEND_SLICES, force }, `send:slice${s}`);
+    bodies.push({ kind: 'send', window, slice: s, slices: SEND_SLICES, force });
   }
+  await net.qSendBatch(env.GUJI_SEND_Q, bodies, 'send:batch');
 }
 
 // ---------------- 入口 ----------------
@@ -1725,6 +2061,30 @@ export default {
 
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // dry-run 巡检（v4.0.2，外部审查 D2，作者复核「dry-run 要划边界」）：
+    // 只抓取 + 解析 + finalize——**不 enrich / 不 AI / 不推送 / 不写 KV / 不入队**。
+    // 用途：源格式变化的早期预警（线上日报红之前，这里先红；fixture 锁已知形态，
+    // dry-run 探未知漂移）。每次跑一片（?shard=0..3，默认 0）：全量 4 片 = 39 源
+    // 全覆盖，单片 ≤10 源 ≤10 子请求，不逼近 50 上限。
+    if (url.pathname === '/api/fetch' && url.searchParams.get('dry') === '1') {
+      const shard = Math.max(0, Math.min(SHARD_COUNT - 1, Number(url.searchParams.get('shard') || 0) || 0));
+      const budget = createBudget();
+      const net = createNet(env, budget);
+      const failures = [];
+      const feeds = FEEDS.slice(shard * SHARD_SIZE, (shard + 1) * SHARD_SIZE);
+      const t0 = Date.now();
+      const raw = await fetchShardFeeds(feeds, net, failures);
+      const preview = finalizeItems(raw);
+      const byCat = {};
+      for (const it of preview) byCat[it.cat] = (byCat[it.cat] || 0) + 1;
+      return json({
+        dryRun: true, shard, shards: SHARD_COUNT, feeds: feeds.length,
+        ms: Date.now() - t0, raw: raw.length, failures,
+        preview: { items: preview.length, byCat },
+        budget: budget.report(),
+      });
+    }
 
     // 抓取班次：入队抓取分片 + 精选（异步处理，轮询 /api/diag 看结果）
     if (url.pathname === '/api/build') {
@@ -1818,6 +2178,10 @@ export {
   KV_KEY, SEEN_SET_KEY,
   Q_FETCH, Q_DIGEST, Q_SEND, Q_RETRY, Q_DLQ,
   SHARD_SIZE, SHARD_COUNT, SEND_SLICES, SHARD_WAIT_MS, SHARD_POLL_MS, shardKey, runKey,
+  // §1 截断/批量常量（v4.0.2 C6：魔法数字入 config）
+  PARSE_ITEMS_MAX, EDGAR_ENTRIES_MAX, EDGAR_ITEMS_MAX, TITLE_MAX, LINK_MAX, DESC_MAX, EDGAR_DESC_MAX,
+  DIGEST_TITLE_MAX, DIGEST_SUMMARY_MAX, DIGEST_REASON_MAX, PROMPT_DESC_MAX, ERR_SNIP_MAX, ERR_RECORD_MAX,
+  AI_TRACE_HEAD_MAX, RUN_TTL,
   ENRICH_MAX, HTML_MAX, MAX_AGE,
   AI_KW, isAI, FEEDS,
   UA_CHROME, FETCH_MS, BATCH_MS, CONCURRENCY,
@@ -1832,6 +2196,8 @@ export {
   DC_KW, recat, SRC_LIMIT,
   // §10 digest
   MATERIAL_MAX,
+  // （EMBED_MODEL/CLUSTER_SIMILARITY/CLUSTER_WINDOW_H/cosineSim/clusterItems/DIGEST_TEMPERATURE
+  //   及 buildPrompt/parseDigest/makeDigest/buildChain/checkFaithful/filterFaithful 均已就地导出）
   // §11 telegram
   CAT_ICON, MSG_GAP_MS, MSG_MAX_ATTEMPTS, RETRY_MAX_ROUNDS, isPermanentTgError, retryAfterMs,
 };

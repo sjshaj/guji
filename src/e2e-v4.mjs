@@ -21,8 +21,12 @@ const kv = {
   put: async (k, v) => { kvStore.set(k, typeof v === 'string' ? v : JSON.stringify(v)); },
 };
 
-const sent = { 'guji-fetch': [], 'guji-digest': [], 'guji-send': [] };
-const qBind = (name) => ({ send: async (body) => { sent[name].push(body); } });
+const sent = { 'guji-fetch': [], 'guji-digest': [], 'guji-send': [], 'guji-retry': [] };
+const qBind = (name) => ({
+  send: async (body) => { sent[name].push(body); },
+  // v4.0.2 B2：批量入队。mock 逐条展开到 sent（保持顺序断言可用）。
+  sendBatch: async (bodies) => { for (const b of bodies) sent[name].push(b); },
+});
 
 const ai = {
   run: async (model) => model.includes('qwen')
