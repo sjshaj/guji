@@ -6,8 +6,12 @@
 #   2. 探 /api/diag（HTTP 200 + digestErr 为空 = 上一班精选链路健康）
 #   3. 任一失败 → 开（或跟进）一个带 health 标签的 issue，失败绝不静默
 #
-# 前置配置（repo Settings → Secrets）：DIAG_KEY = worker 侧 env.DIAG_KEY 同值。
-# 未配置时 diag 返回 403 → 本检查失败并开 issue 提醒（配置漂移告警）。
+# 前置配置：repo secret DIAG_KEY 与 worker 侧 env.DIAG_KEY 同值。
+# C5 灰度语义（v4.0.2.1）：worker 侧未配置 DIAG_KEY 时端点放行——
+#   - 两边都未配置：diag 返回 200，本检查通过（但等于没校验身份）
+#   - worker 配了而本 repo secret 漏配：curl 带空 key → 403 → 本检查失败并开
+#     issue 提醒（这正是配置漂移告警的触发路径）
+#   - 两边同值：200 且身份校验真正生效
 # 手动触发：Actions 页 → Health check → Run workflow。
 
 name: Health check
@@ -49,18 +53,23 @@ jobs:
         env:
           DIAG_KEY: ${{ secrets.DIAG_KEY }}
         run: |
-          code=$(curl -sS -o /tmp/diag.json -w '%{http_code}' "https://guji.dpdns.org/api/diag?key=$DIAG_KEY")
+          code=$(curl -sS -o /tmp/diag.json -w '%{http_code}' -G --data-urlencode "key=$DIAG_KEY" "https://guji.dpdns.org/api/diag")
           echo "HTTP $code"
           head -c 400 /tmp/diag.json; echo
           if [ "$code" != "200" ]; then
             echo "::error::diag HTTP $code（DIAG_KEY secret 未设置或与 worker 侧不一致？）"
             exit 1
           fi
-          # digestErr 为字符串 = 上一班精选失败（推送走了英文兜底），要有人看
-          if grep -q '"digestErr": *"' /tmp/diag.json; then
-            echo "::error::上一班 digestErr 非空：$(grep -o '"digestErr": *"[^"]*"' /tmp/diag.json | head -c 200)"
-            exit 1
-          fi
+          # digestErr 非 null/非空 = 上一班精选失败（推送走了英文兜底），要有人看
+          python3 - <<'EOF'
+          import json, sys
+          d = json.load(open('/tmp/diag.json'))
+          err = d.get('digestErr')
+          if err:
+              print(f"::error::上一班 digestErr 非空：{str(err)[:200]}")
+              sys.exit(1)
+          print(f"diag OK: window={d.get('window')} items={d.get('items')} digest={d.get('digest')}")
+          EOF
       - name: 失败时开/跟进 issue
         if: failure()
         uses: actions/github-script@v7
