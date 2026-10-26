@@ -3,7 +3,7 @@
 > 事实变更清单（叙事版历史见 `DEVLOG.md`）。格式：版本 · 日期 · 变更 · 状态。
 > 更新规矩：每次线上部署在这里加一条，DEVLOG 只记「为什么和踩坑」。
 
-## v4.0.1 · 2026-10-25 深夜 · 外部审查驱动修复批次（当前线上）
+## v4.0.1 · 2026-10-25 深夜 · 外部审查驱动修复批次
 
 > 来源：外部 AI 审查链五份文档（PR #1 审查 → 作者复核一 → PR #3 回复 →
 > PR #4 调研 → 作者复核二，均存 `docs/`）。落地范围为「作者认同 + 时机成熟」项，
@@ -93,7 +93,7 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
 - **新 digest 路径未手动触发**（会砍掉 05:50 定时班 fresh 窗口，DEVLOG §4.6.5），
   留给 05:40-06:00 无人值守首班自然验收
 
-## v4.0.2.1 · 2026-10-26 凌晨 · 运维加固批次（当前线上）
+## v4.0.2.1 · 2026-10-26 凌晨 · 运维加固批次
 
 > 来源：ROADMAP 剩余项中「不改核心路径、当晚可闭环」的五项（C5/D2/B3/D3/D4）。
 > 叙事见 DEVLOG §4.7。
@@ -135,6 +135,36 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
   D2 DLQ 告警链路未触发（无死信），行为由 smoke 测试锁定
 - `?health=1` 显示 shardRuns=4——全部来自 10-25 pm 班 4 分片；更早班次由 v3 跑
   （run 记录体系 v4 才引入），属预期；D4 基线从 10-26 am 班起逐班积累
+
+## v4.0.2.2 · 2026-10-26 上午 · 审查闭环补全：B1 A/B 实验（当前线上）
+
+> 来源：外部审查 B1（PR #1 主张「enrich 改 HTMLRewriter」）+ PR #3 审查者回复的
+> 「零成本 A/B」修正方案。作者复核一曾把 B1 从「直接替换」降级为「可选 A/B 实验」，
+> 并在调研复核中「全盘采纳」PR #3 的零成本设计——但此前一直未落地；本次补全，
+> 闭环「审查 AI 提出、作者认同的问题」。
+
+**新增**
+- **B1 A/B 实验**（`htmlRewriterText` + enrichMaterial 回传 abExp）：`fetchViaToMarkdown`
+  已抓到整页 HTML，复用它对同份 HTML 裸跑 `HTMLRewriter` 抽文本，与 toMarkdown 的
+  desc 两版各取前 200 字记进 `aiTrace`（`trace.stage='b1-ab'`）。纯 CPU、零子请求、
+  零 KV 污染、**不替换生产 desc**——只供人眼比对两种抽取的质量，再决定是否值得上。
+  Jina 路径无同份 HTML，`rewriter=null` 不进 A/B 采集
+
+**实现要点**
+- `fetchViaToMarkdown` / `fetchViaJina` 返回形态改为 `{ md, rewriter }`；
+  `enrichMaterial` 回传 abExp 数组，makeDigest 挂入 trace
+- HTMLRewriter 是**流式 transform**：必须 `await res.text()` 消费 body 后 handler 才跑完，
+  否则 text 恒空（与 toMarkdown 同为 Workers 运行时专属 API，Node smoke 测不到，测试注入 fake 覆盖）
+
+**测试**
+- smoke 100 → 105 项：B1 接线（toMarkdown 路径产生采集 / Jina 路径不进 / 两版截断 200 字）；
+  HTMLRewriter 是 Workers 专属 API，Node 无原生实现，测试注入 fake 覆盖后还原全局
+
+**验证**
+- 105 项测试全绿 → 部署版本 **1a09990f**（9fc50e2）→ `/api/diag` 200 / 页面 200 /
+  items 149 / digest 9 / digestErr 空
+- `trace.stage='b1-ab'` 将在今晚 pm 班真实精选（有薄摘要需 enrich 的条目）时出现于
+  `/api/diag` 的 aiTrace，供人眼比对两版 desc 质量
 
 ## v4.0 · 2026-10-25 · 队列化架构上线
 
