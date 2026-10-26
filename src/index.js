@@ -393,8 +393,12 @@ export function mkItem(source, f, descMax = DESC_MAX) {
  * @param {string} label 预算记账标签（默认 run:{stage}）
  */
 async function markRun(net, window, stage, data, label) {
+  // v4.0.2.3（根治「早班不累计」观察盲区）：原先 .catch(()=>{}) 静默吞掉 KV 写失败，
+  // 导致「cron 触发了但 run 记录没写进去」与「真的没触发」无法区分。改为把错误打到
+  // Workers 日志（控制台可见），诊断期至少能知道 KV 写是否失败而非凭空消失。
   await net.kvPut(runKey(window, stage), JSON.stringify(data),
-    { expirationTtl: RUN_TTL }, label || `run:${stage}`).catch(() => {});
+    { expirationTtl: RUN_TTL }, label || `run:${stage}`)
+    .catch(e => console.error(`[markRun] KV 写失败 run:${window}:${stage}: ${e && e.message}`));
 }
 
 /**
@@ -2195,31 +2199,53 @@ export default {
    * 每次触发 ≤4 个子请求（队列发送，保守计入）。
    */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil((async () => {
+    // v4.0.2.3（根治「早班不累计」观察盲区 + 冷启动加固）：
+    // 1) 触发即写 cron 心跳（任何入队之前）——区分「cron 没触发」与「触发了但入队挂了」；
+    // 2) 入队成功写 enqueue 记录，失败写 cron-error 记录，三者全部落 KV（可见、可查），
+    //    不再像旧版那样只 console.error 后随日志过期消失；
+    // 3) 同一 promise 既 waitUntil（保活隔离）又 await——冷启动下保证 sendBatch 在
+    //    handler 返回前真正落到队列，避免隔离被回收导致早班（长时间空闲后首班）入队丢失
+    //    （这是「早班独发、晚班不发」最可疑的根因；晚班 Worker 温热不踩）。
+    const p = (async () => {
       const budget = createBudget();
       const net = createNet(env, budget);
+      const at = event.scheduledTime || Date.now();
+      const window = currentWindow(at);
+      const minute = bjDate(at).getUTCMinutes();
+      const kind = minute === FETCH_MINUTE ? 'fetch'
+        : minute === DIGEST_MINUTE ? 'digest'
+        : minute === SEND_MINUTE ? 'send' : 'unknown';
       try {
-        const at = event.scheduledTime || Date.now();
-        const window = currentWindow(at);
-        const minute = bjDate(at).getUTCMinutes();
-        if (minute === FETCH_MINUTE) {
+        // 心跳：cron 已触发。KV 写失败也记日志，不静默。
+        await net.kvPut(runKey(window, 'cron'), JSON.stringify({ at: Date.now(), cron: event.cron, minute, kind }),
+          { expirationTtl: RUN_TTL }, `run:cron`).catch(e => console.error(`[cron] 心跳写失败 ${window}: ${e && e.message}`));
+        if (kind === 'fetch') {
           // 只入队抓取；精选由 :50 的 cron 单独入队（10 分钟缓冲给抓取消费者）
           await enqueueFetch(env, net, window);
           console.error(`[cron] ${window} 抓取入队：${SHARD_COUNT} 分片，预算 ${budget.total}`);
-        } else if (minute === DIGEST_MINUTE) {
+        } else if (kind === 'digest') {
           // at 同 enqueueBuild：供分片新鲜度校验（B3，v4.0.2.1）
           await net.qSend(env.GUJI_DIGEST_Q, { kind: 'digest', window, full: false, at: Date.now() }, 'digest');
           console.error(`[cron] ${window} 精选入队，预算 ${budget.total}`);
-        } else if (minute === SEND_MINUTE) {
+        } else if (kind === 'send') {
           await enqueueSend(env, net, window, false);
           console.error(`[cron] ${window} 推送入队：${SEND_SLICES} 片，预算 ${budget.total}`);
         } else {
           console.error(`[cron] 未识别的分钟数 ${minute}（cron=${event.cron}），忽略`);
+          return;
         }
+        // 入队成功记录
+        await net.kvPut(runKey(window, 'enqueue'), JSON.stringify({ at: Date.now(), kind, budget: budget.report() }),
+          { expirationTtl: RUN_TTL }, `run:enqueue`).catch(e => console.error(`[cron] enqueue 记录写失败 ${window}: ${e && e.message}`));
       } catch (e) {
-        console.error(`[cron] 入队失败：${e && e.message}`);
+        // 入队失败：写 durable 错误记录（不再是仅 console.error 后消失）
+        console.error(`[cron] ${window} 入队失败：${e && e.message}`);
+        await net.kvPut(runKey(window, 'cron-error'), JSON.stringify({ at: Date.now(), kind, err: String(e && e.message || e).slice(0, ERR_RECORD_MAX) }),
+          { expirationTtl: RUN_TTL }, `run:cron-error`).catch(() => {});
       }
-    })());
+    })();
+    ctx.waitUntil(p);
+    await p;
   },
 
   /**

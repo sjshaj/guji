@@ -291,5 +291,40 @@ globalThis.HTMLRewriter = _HTMLRewriter;
 globalThis.fetch = _fetch;
 globalThis.Response = _Response;
 
+// ---- scheduled 处理器：cron 心跳 + 同步 await 入队（v4.0.2.3 根治「早班不累计」）----
+{
+  const kvStore = {};
+  const sendCalls = [];
+  const env = {
+    GUJI_KV: { get: async () => null, put: async (k) => { kvStore[k] = true; } },
+    GUJI_FETCH_Q: { sendBatch: async (b) => { sendCalls.push(['fetch', b.length]); } },
+    GUJI_DIGEST_Q: { send: async () => { sendCalls.push(['digest', 1]); } },
+    GUJI_SEND_Q: { sendBatch: async (b) => { sendCalls.push(['send', b.length]); } },
+  };
+  const ctx = { waitUntil: () => {} };
+  // 抓取班：UTC 21:40 = 北京 05:40 am 班
+  await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 40), cron: '40,50 21 * * *' }, env, ctx);
+  ok('guji:v4:run:2026-10-26-am:cron' in kvStore, 'scheduled：触发即写 cron 心跳（区分「没触发」与「触发了」）');
+  ok('guji:v4:run:2026-10-26-am:enqueue' in kvStore, 'scheduled：await 入队完成后写 enqueue 记录（冷启动加固）');
+  ok(sendCalls.some(c => c[0] === 'fetch' && c[1] === 4), 'scheduled：抓取班入队 4 分片');
+  // 精选班
+  await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 50), cron: '40,50 21 * * *' }, env, ctx);
+  ok(sendCalls.some(c => c[0] === 'digest'), 'scheduled：精选班入队 1 条');
+  // 推送班
+  await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 22, 0), cron: '0 22 * * *' }, env, ctx);
+  ok(sendCalls.some(c => c[0] === 'send' && c[1] === 3), 'scheduled：推送班入队 3 片');
+  // 失败路径：入队抛错 → 写 durable cron-error 记录（不再仅 console.error 后消失）
+  const errKv = {};
+  const envErr = {
+    GUJI_KV: { get: async () => null, put: async (k) => { errKv[k] = true; } },
+    GUJI_FETCH_Q: { sendBatch: async () => { throw new Error('queue cold start boom'); } },
+    GUJI_DIGEST_Q: { send: async () => {} },
+    GUJI_SEND_Q: { sendBatch: async () => {} },
+  };
+  await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 40), cron: '40,50 21 * * *' }, envErr, ctx);
+  ok('guji:v4:run:2026-10-26-am:cron' in errKv, 'scheduled(失败)：心跳仍先落库');
+  ok('guji:v4:run:2026-10-26-am:cron-error' in errKv, 'scheduled(失败)：入队失败写 durable cron-error（根治观察盲区）');
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);
