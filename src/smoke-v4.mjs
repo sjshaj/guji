@@ -252,5 +252,44 @@ ok(m.pastWindow(Date.UTC(2026, 9, 26, 2, 0), 0, 'am') === '2026-10-26-am', 'past
 ok(m.pastWindow(Date.UTC(2026, 9, 26, 2, 0), 1, 'pm') === '2026-10-25-pm', 'pastWindow：前一天 pm');
 ok(m.pastWindow(Date.UTC(2026, 9, 1, 2, 0), 1, 'am') === '2026-09-30-am', 'pastWindow：跨月（10-01 北京 → 9-30）');
 
+// ---- B1 A/B 实验（外部审查 B1 / PR#3 零成本方案）----
+// HTMLRewriter 是 Workers 运行时专属 API，Node 原生无实现 → 注入 fake 测接线，测完还原全局。
+const _HTMLRewriter = globalThis.HTMLRewriter;
+const _fetch = globalThis.fetch;
+const _Response = globalThis.Response;
+globalThis.Response = class {
+  constructor(body, init) { this._body = body; this.ok = true; this.headers = { get: () => 'text/html' }; }
+  text() { return Promise.resolve(String(this._body ?? '')); }
+};
+globalThis.HTMLRewriter = class {
+  on(sel, h) { this.h = h; return this; }
+  transform(resp) {
+    const text = String(resp._body ?? '').replace(/<[^>]+>/g, ' '); // 模拟 HTMLRewriter 裸抽：去标签留文本
+    if (this.h && this.h.text) this.h.text({ text });
+    return { text: async () => text };
+  }
+};
+const sampleHtml = '<html><body><nav>Menu Sign in Cookie Policy Terms of Service</nav><p>OpenAI released a new GPU cluster for training large language models. The cluster uses custom accelerators and delivers record throughput for inference workloads across many regions. Researchers reported improvements in both latency and energy efficiency compared to the previous generation of hardware deployed last year.</p><p>Nvidia announced a roadmap for the next two years covering datacenter and edge deployments with partners in multiple countries building local fabs.</p></body></html>';
+const mdText = '# Title\n\nSome markdown body text about GPUs and accelerators.';
+globalThis.fetch = async () => new Response(sampleHtml); // 覆盖全局 fetch，喂样本 HTML
+const mkB1Net = (env) => m.createNet({
+  GUJI_KV: { get: async () => null, put: async () => {} },
+  AI: { toMarkdown: async () => [{ data: mdText, format: 'text' }] },
+}, m.createBudget({ silent: true }), env);
+const b1item = { link: 'https://x.test/a', desc: '', title: 't', source: 'X', srcId: 'x', cat: '模型', kind: 'rss', win: '7d', ts: Date.now() };
+// toMarkdown 路径（无 JINA_KEY）：应产生 A/B 采集，含两版 desc
+const ab1 = await m.enrichMaterial([b1item], mkB1Net({}));
+ok(ab1.length === 1, 'B1：toMarkdown 路径产生 1 条 A/B 采集');
+ok(ab1[0] && ab1[0].url === 'https://x.test/a', 'B1：采集含原始 url');
+ok(ab1[0] && /markdown/.test(ab1[0].toMarkdown) && /OpenAI/.test(ab1[0].htmlRewriter), 'B1：toMarkdown 含 markdown 文本、htmlRewriter 裸抽含正文本');
+ok(ab1[0] && ab1[0].toMarkdown.length <= 200 && ab1[0].htmlRewriter.length <= 200, 'B1：两版 desc 均截断至 200 字');
+// Jina 路径（有 JINA_KEY）：无同份 HTML，rewriter=null → 不进 A/B 采集
+const ab2 = await m.enrichMaterial([b1item], mkB1Net({ JINA_KEY: 'fake' }));
+ok(ab2.length === 0, 'B1：Jina 路径无同份 HTML → 不进 A/B 采集（仅 toMarkdown 路径对比）');
+// 还原全局，避免污染后续与 CI
+globalThis.HTMLRewriter = _HTMLRewriter;
+globalThis.fetch = _fetch;
+globalThis.Response = _Response;
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

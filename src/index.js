@@ -175,6 +175,7 @@ const PROMPT_DESC_MAX = 100;   // 提示词里每条素材的摘要片段长度�
 const ERR_SNIP_MAX = 80;       // 错误信息截断（日志/失败记录防爆）
 const ERR_RECORD_MAX = 300;    // KV 错误记录体的截断（比日志宽，保留排查线索）
 const AI_TRACE_HEAD_MAX = 120; // aiTrace 里模型输出头部预览长度（诊断「模型回了什么」）
+const AB_EXP_HEAD = 200;      // B1 A/B 实验：toMarkdown 与 HTMLRewriter 两版 desc 各记前 200 字（仅 aiTrace，不落库）
 const RUN_TTL = 2 * 86400;     // run/分片 KV 记录的 TTL（秒）——覆盖下一班同 window 键前的保洁
 const HEALTH_DAYS = 3;         // diag ?health=1 的聚合天数（v4.0.2.1，ROADMAP D4）。
                               // 3 天 × 2 班 × 4 片 = 24 次 KV 读，叠加现有 diag 读取
@@ -1011,17 +1012,29 @@ export function parseDigest(text, material) {
 //   2. 否则 → Cloudflare 原生 Workers AI toMarkdown（复用 [ai] 绑定，零额外配置）
 // 只补 desc 短的（EDGAR 条款名、官方短通稿），充分的条目不碰；失败静默回退原摘要。
 
-async function enrichMaterial(material, net) {
+export async function enrichMaterial(material, net) {
   const thin = material.filter(it => (!it.desc || it.desc.length < 120) && /^https?:\/\//.test(it.link || ''));
-  if (!thin.length) return material;
+  const abExp = []; // B1 A/B 实验采集：toMarkdown 与 HTMLRewriter 两版 desc 对比（仅回传，不落库）
+  if (!thin.length) return abExp;
   const targets = thin.slice(0, ENRICH_MAX); // ⚠️ 上限 4 条：队列化后 digest 班 19/50，余量充足
   for (const it of targets) { // 串行：峰值内存可控（并行大页面易触发 Worker 资源上限 1102）
     try {
-      const md = net.env && net.env.JINA_KEY ? await fetchViaJina(it.link, net) : await fetchViaToMarkdown(it.link, net);
-      if (md && md.length > (it.desc || '').length + 40) it.desc = md.slice(0, DESC_MAX); // 确实更丰富才采用
+      const got = net.env && net.env.JINA_KEY ? await fetchViaJina(it.link, net) : await fetchViaToMarkdown(it.link, net);
+      const md = got && got.md;
+      if (md && md.length > (it.desc || '').length + 40) {
+        it.desc = md.slice(0, DESC_MAX); // 确实更丰富才采用
+        // B1 A/B：仅 toMarkdown 路径手里有同份 HTML（Jina 路径无），记录两版对比供人眼评估质量
+        if (got && got.rewriter) {
+          abExp.push({
+            url: it.link,
+            toMarkdown: md.slice(0, AB_EXP_HEAD),
+            htmlRewriter: got.rewriter.slice(0, AB_EXP_HEAD),
+          });
+        }
+      }
     } catch (e) { /* 静默：保留原摘要 */ }
   }
-  return material;
+  return abExp;
 }
 
 async function fetchViaJina(url, net) {
@@ -1033,8 +1046,27 @@ async function fetchViaJina(url, net) {
       headers: { 'Accept': 'text/plain', 'Authorization': 'Bearer ' + net.env.JINA_KEY }
     }, 'enrich:jina');
     if (!r.ok) return null;
-    return cleanMd(await r.text()).slice(0, DESC_MAX);
+    return { md: cleanMd(await r.text()).slice(0, DESC_MAX), rewriter: null }; // Jina 路径无同份 HTML，不参与 B1 A/B
   } finally { clearTimeout(timer); }
+}
+
+// Cloudflare 原生方案（参照 doocs/anything-md）：抓 HTML → env.AI.toMarkdown → 纯文本
+// B1 A/B 实验（外部审查 B1 / PR#3 零成本方案）：对同一份已抓 HTML 裸跑 HTMLRewriter 抽文本，
+// 与 toMarkdown 的 desc 对比质量。纯 CPU、零子请求、零 KV 污染；结果只记 aiTrace，不替换生产输出。
+// ⚠️ HTMLRewriter 是流式 transform——必须消费返回 Response 的 body（await .text()）handler 才会跑完，
+//   否则 text 永远为空。该 API 仅在 Workers 运行时可用，Node smoke 测不到（与 fetchViaToMarkdown 同命运）。
+async function htmlRewriterText(html) {
+  if (!html) return '';
+  let text = '';
+  try {
+    const rw = new HTMLRewriter()
+      .on('p, div, span, li, h1, h2, h3, h4, h5, h6, a, td, th, article, section, blockquote', {
+        text(t) { text += t.text; } // 裸抽：导航栏/Cookie 声明会混入——这正是要度量的「噪音」
+      });
+    const res = rw.transform(new Response(html, { headers: { 'content-type': 'text/html' } }));
+    await res.text(); // 消费 body 触发流式 handler
+  } catch (e) { return ''; }
+  return cleanMd(text).replace(/\s+/g, ' ').trim().slice(0, AB_EXP_HEAD);
 }
 
 // Cloudflare 原生方案（参照 doocs/anything-md）：抓 HTML → env.AI.toMarkdown → 纯文本
@@ -1056,6 +1088,7 @@ async function fetchViaToMarkdown(url, net) {
   } finally { clearTimeout(timer); }
   if (!html || html.length < 200) throw new Error('html ' + (html ? html.length : 0) + 'B');
   if (html.length > HTML_MAX) html = html.slice(0, HTML_MAX); // 截断：防止超大页面吃爆内存
+  const rewriter = await htmlRewriterText(html); // B1 A/B：同一份 HTML 裸抽文本，与 toMarkdown 对比
   const call = net.aiToMarkdown([{ name: 'page.html', blob: new Blob([html], { type: 'text/html' }) }], 'enrich:md');
   const timeout = new Promise(res => setTimeout(() => res(null), 90000)); // 冷启动容忍
   const results = await Promise.race([call, timeout]);
@@ -1064,7 +1097,7 @@ async function fetchViaToMarkdown(url, net) {
   if (res.format === 'error') throw new Error('toMarkdown: ' + String(res.error).slice(0, ERR_SNIP_MAX));
   let md = String(res.data || '');
   md = md.replace(/^---\n[\s\S]*?\n---\n*/, ''); // 去 YAML frontmatter
-  return cleanMd(md).slice(0, DESC_MAX);
+  return { md: cleanMd(md).slice(0, DESC_MAX), rewriter };
 }
 
 // ---------------- 精选忠实度校验 ----------------
@@ -1356,7 +1389,8 @@ export async function makeDigest(items, net) {
   if (!items.length) return { digest: null, trace: [] };
   const trace = []; // 逐模型诊断：供 /api/diag 排查「精选 0 条」
   const material = items.slice(0, MATERIAL_MAX);
-  await enrichMaterial(material, net); // 薄摘要先补全文（Jina key 或原生 toMarkdown），模型看得更深
+  const abExp = await enrichMaterial(material, net); // 薄摘要补全文（Jina/原生 toMarkdown）；返回 B1 A/B 采集
+  if (abExp.length) trace.push({ stage: 'b1-ab', note: 'B1 A/B：toMarkdown vs HTMLRewriter 裸抽 desc 对比（前200字，仅供人眼评估质量，不替换生产输出）', items: abExp });
   const clustered = await clusterMaterial(material, net, trace); // v4.0.2 事件聚类（调研 P1-⑤；失败整体跳过）
   const prompt = buildPrompt(clustered);
   const chain = buildChain(net, prompt);
