@@ -11,7 +11,7 @@ ok(m.currentWindow(Date.UTC(2026, 9, 25, 13, 40)) === '2026-10-25-pm', 'UTC13:40
 
 // ---- 分片与预算 ----
 ok(m.SHARD_COUNT === 4, '39 源 → 4 个分片');
-ok(m.PLAN_PEAK === 29 && m.PLAN_PEAK <= m.SUBREQUEST_LIMIT, `预算峰值 ${m.PLAN_PEAK}/50 ≤ 上限`);
+ok(m.PLAN_PEAK === 33 && m.PLAN_PEAK <= m.SUBREQUEST_LIMIT, `预算峰值 ${m.PLAN_PEAK}/50 ≤ 上限（v4.0.2.4 B2 账实对齐：send.slice 19→20、digest 29→33）`);
 ok(m.shardKey('2026-10-25-am', 2) === 'guji:v4:shard:2026-10-25-am:2', '分片键格式');
 ok(m.runKey('2026-10-25-am', 'fetch:0') === 'guji:v4:run:2026-10-25-am:fetch:0', '运行记录键格式');
 
@@ -121,6 +121,13 @@ ok(rubricOut[2].title === '旧格式条' || rubricOut[3].title === '旧格式条
 ok(rubricOut.find(x => x.title === '畸形条').score.impact === 8 && rubricOut.find(x => x.title === '畸形条').score.density === 10 && rubricOut.find(x => x.title === '畸形条').score.timeliness === 5, 'P0-①：畸形分数归一化（字符串/超范围/缺维 → 夹 1-10，缺维中性 5）');
 ok(rubricOut.every(x => x.score.total >= 4 && x.score.total <= 40), 'P0-①：总分范围 4-40');
 ok(m.buildPrompt(items).includes('scores') && m.buildPrompt(items).includes('reason'), 'P0-①：提示词输出契约含 reason + scores');
+
+// v4.0.2.4（外部审查 A1 实锤）：截断的嵌套 rubric 输出 → 第三级容错必须仍恢复完整条目
+// 模拟 max_tokens 截断：entry1 完整（含嵌套 scores），entry2 写到一半被切断，且无收尾 ]
+// 旧正则 /\{[^{}]*\}/g 遇内层 { 即断，只抽到 scores 碎片（无 idx）→ 全 0 条（容错链变两级半）
+const truncatedRubric = '[{"idx":1,"reason":"r","scores":{"impact":8,"density":7,"authority":9,"timeliness":8},"title":"T1","summary":"S1"},{"idx":2,"reason":"r2","scores":{"impact":6,"density":5,';
+const dTrunc = m.parseDigest(truncatedRubric, rubricMat);
+ok(dTrunc.length === 1 && dTrunc[0].title === 'T1' && dTrunc[0].score.impact === 8, 'A1：截断嵌套 rubric → 第三级容错恢复完整条目（旧正则会丢光成 0 条）');
 
 // ⑤ embedding 事件聚类（限定采纳：0.85 从严 + 48h 门限 + 拿不准不合并）
 // 注意 ts 用毫秒（线上契约：pickDate 返回 Date.parse 毫秒值；toSec 期望毫秒入参）
@@ -275,7 +282,9 @@ globalThis.fetch = async () => new Response(sampleHtml); // 覆盖全局 fetch�
 const mkB1Net = (env) => m.createNet({
   GUJI_KV: { get: async () => null, put: async () => {} },
   AI: { toMarkdown: async () => [{ data: mdText, format: 'text' }] },
-}, m.createBudget({ silent: true }), env);
+  ...env, // ⚠️ 必须合并进第一个参数——createNet(env, budget) 只收两个参数，net.env 即第一参；
+          // 旧版把 JINA_KEY 放第三参被静默忽略，「Jina 路径」测试实际跑的是 toMarkdown 路径（假绿）
+}, m.createBudget({ silent: true }));
 const b1item = { link: 'https://x.test/a', desc: '', title: 't', source: 'X', srcId: 'x', cat: '模型', kind: 'rss', win: '7d', ts: Date.now() };
 // toMarkdown 路径（无 JINA_KEY）：应产生 A/B 采集，含两版 desc
 const ab1 = await m.enrichMaterial([b1item], mkB1Net({}));
@@ -283,9 +292,16 @@ ok(ab1.length === 1, 'B1：toMarkdown 路径产生 1 条 A/B 采集');
 ok(ab1[0] && ab1[0].url === 'https://x.test/a', 'B1：采集含原始 url');
 ok(ab1[0] && /markdown/.test(ab1[0].toMarkdown) && /OpenAI/.test(ab1[0].htmlRewriter), 'B1：toMarkdown 含 markdown 文本、htmlRewriter 裸抽含正文本');
 ok(ab1[0] && ab1[0].toMarkdown.length <= 200 && ab1[0].htmlRewriter.length <= 200, 'B1：两版 desc 均截断至 200 字');
-// Jina 路径（有 JINA_KEY）：无同份 HTML，rewriter=null → 不进 A/B 采集
-const ab2 = await m.enrichMaterial([b1item], mkB1Net({ JINA_KEY: 'fake' }));
+// Jina 路径（有 JINA_KEY，现已真正生效）：无同份 HTML，rewriter=null → 不进 A/B 采集
+// （用独立克隆：旧版共享 b1item 被 ab1 改写 desc 后，ab2 靠「md 不再更长」碰巧不采集——假绿）
+const ab2 = await m.enrichMaterial([{ ...b1item }], mkB1Net({ JINA_KEY: 'fake' }));
 ok(ab2.length === 0, 'B1：Jina 路径无同份 HTML → 不进 A/B 采集（仅 toMarkdown 路径对比）');
+// v4.0.2.4（外部审查 B1 修正采样偏差）：原写法把采集裹在「toMarkdown 长度大胜」的 if 内，
+// 样本 100% 来自 toMarkdown 赢的场景，实验结果系统性偏向 toMarkdown。修正后只要手里有两版就采。
+const b1itemLong = { ...b1item, desc: 'x'.repeat(110) }; // 110 < thin 阈值 120，但远超 md(~55) 长度
+const ab1b = await m.enrichMaterial([b1itemLong], mkB1Net({}));
+ok(ab1b.length === 1, 'B1：toMarkdown 不比原 desc 长时仍采集（修正「只采 toMarkdown 赢」偏差）');
+ok(ab1b[0] && ab1b[0].toMarkdown && ab1b[0].toMarkdown.length > 0 && /OpenAI/.test(ab1b[0].htmlRewriter || ''), 'B1：toMarkdown 偏短时两版仍完整记录（md 存在则为文本，仅 md 为空才 null 占位）');
 // 还原全局，避免污染后续与 CI
 globalThis.HTMLRewriter = _HTMLRewriter;
 globalThis.fetch = _fetch;
@@ -304,8 +320,8 @@ globalThis.Response = _Response;
   const ctx = { waitUntil: () => {} };
   // 抓取班：UTC 21:40 = 北京 05:40 am 班
   await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 40), cron: '40,50 21 * * *' }, env, ctx);
-  ok('guji:v4:run:2026-10-26-am:cron' in kvStore, 'scheduled：触发即写 cron 心跳（区分「没触发」与「触发了」）');
-  ok('guji:v4:run:2026-10-26-am:enqueue' in kvStore, 'scheduled：await 入队完成后写 enqueue 记录（冷启动加固）');
+  ok('guji:v4:run:2026-10-26-am:cron:fetch' in kvStore, 'scheduled：触发即写 cron:fetch 心跳（区分「没触发」与「触发了」）');
+  ok('guji:v4:run:2026-10-26-am:enqueue:fetch' in kvStore, 'scheduled：await 入队完成后写 enqueue:fetch 记录（冷启动加固）');
   ok(sendCalls.some(c => c[0] === 'fetch' && c[1] === 4), 'scheduled：抓取班入队 4 分片');
   // 精选班
   await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 50), cron: '40,50 21 * * *' }, env, ctx);
@@ -313,6 +329,9 @@ globalThis.Response = _Response;
   // 推送班
   await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 22, 0), cron: '0 22 * * *' }, env, ctx);
   ok(sendCalls.some(c => c[0] === 'send' && c[1] === 3), 'scheduled：推送班入队 3 片');
+  // v4.0.2.4（外部审查 A2）：早班三触发点各写独立键——fetch 缺席 + digest/send 在场时，
+  // cron:fetch 仍缺失（不再因同 window 键被覆盖成假阳性，糊住 v4.0.2.3 自己的验证目标）
+  ok(kvStore['guji:v4:run:2026-10-26-am:cron:fetch'] && kvStore['guji:v4:run:2026-10-26-am:cron:digest'] && kvStore['guji:v4:run:2026-10-26-am:cron:send'], 'A2：早班三触发点各写独立键（fetch/digest/send 不复用同键）');
   // 失败路径：入队抛错 → 写 durable cron-error 记录（不再仅 console.error 后消失）
   const errKv = {};
   const envErr = {
@@ -322,8 +341,8 @@ globalThis.Response = _Response;
     GUJI_SEND_Q: { sendBatch: async () => {} },
   };
   await m.default.scheduled({ scheduledTime: Date.UTC(2026, 9, 25, 21, 40), cron: '40,50 21 * * *' }, envErr, ctx);
-  ok('guji:v4:run:2026-10-26-am:cron' in errKv, 'scheduled(失败)：心跳仍先落库');
-  ok('guji:v4:run:2026-10-26-am:cron-error' in errKv, 'scheduled(失败)：入队失败写 durable cron-error（根治观察盲区）');
+  ok('guji:v4:run:2026-10-26-am:cron:fetch' in errKv, 'scheduled(失败)：心跳仍先落库');
+  ok('guji:v4:run:2026-10-26-am:cron-error:fetch' in errKv, 'scheduled(失败)：入队失败写 durable cron-error:fetch（根治观察盲区）');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

@@ -491,8 +491,11 @@ export const SUBREQUEST_WARN = 45;
 export const BUDGET_PLAN = [
   { stage: 'cron.enqueue', label: '入队 4 条抓取分片消息（队列发送保守计入）', quota: 4 },
   { stage: 'fetch.shard', label: '单分片：10 源 fetch + Anthropic seen 2 + 诊断埋点 2 + 分片落库 1', quota: 16 },
-  { stage: 'digest', label: '读 4 分片 + latest 1 + 增强 4×2 + 模型链 4 + 落库 2（等分片轮询另有 40 预算护栏）', quota: 19 },
-  { stage: 'send.slice', label: '单推送片：latest 1 + ≤9 条消息×至多 3 次尝试 + 统计 1', quota: 29 },
+  // v4.0.2.4（外部审查 B2）：账实对齐——digest 实际多了 P1-⑤ aiEmbed +1（→20），
+  // send.slice 末片实际多了 DLQ 告警 4（kvGet×2+send+kvPut，→33）。仍远低于 50，无超支风险，
+  // 但「应然表」须跟上「实然」，否则下一个改代码的 AI 对着旧表算账会算错。
+  { stage: 'digest', label: '读 4 分片 + latest 1 + 增强 4×2 + 模型链 4 + aiEmbed 1(P1-⑤) + 落库 2（等分片轮询另有 40 预算护栏）', quota: 20 },
+  { stage: 'send.slice', label: '单推送片：latest 1 + ≤9 条消息×至多 3 次尝试 + 统计 1 + 末片 DLQ 告警 4(kvGet×2+send+kvPut)', quota: 33 },
 ];
 
 /** 静态预算峰值（单次调用最大消耗），单测断言它 ≤ SUBREQUEST_LIMIT */
@@ -981,7 +984,11 @@ export function parseDigest(text, material) {
   }
   if (!Array.isArray(arr)) {
     arr = [];
-    const re = /\{[^{}]*\}/g;
+    // v4.0.2.4（外部审查 A1）：支持一层嵌套——v4.0.2 rubric 的 scores 是嵌套对象
+    // {idx,reason,scores:{...},title,summary}。旧正则 /\{[^{}]*\}/g 遇内层 { 即断，
+    // 截断输出下只抽到 scores 碎片（无 idx）→ 全 0 条。新正则跨越一层嵌套，
+    // 让「前面全挂了还能捞回完整条目」的容错真正生效（外部审查 A1 实测复现）。
+    const re = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
     let m;
     while ((m = re.exec(s))) {
       try { arr.push(JSON.parse(m[0])); } catch (e3) { /* 跳过这个残段 */ }
@@ -1027,14 +1034,17 @@ export async function enrichMaterial(material, net) {
       const md = got && got.md;
       if (md && md.length > (it.desc || '').length + 40) {
         it.desc = md.slice(0, DESC_MAX); // 确实更丰富才采用
-        // B1 A/B：仅 toMarkdown 路径手里有同份 HTML（Jina 路径无），记录两版对比供人眼评估质量
-        if (got && got.rewriter) {
-          abExp.push({
-            url: it.link,
-            toMarkdown: md.slice(0, AB_EXP_HEAD),
-            htmlRewriter: got.rewriter.slice(0, AB_EXP_HEAD),
-          });
-        }
+      }
+      // B1 A/B（v4.0.2.4 外部审查 B1 修正采样偏差）：只要手里有两版（仅 toMarkdown 路径
+      // 持有同份 HTML 的 rewriter）就无条件记录对比。原写法把采集裹在「toMarkdown 长度
+      // 大胜」的 if 内，样本 100% 来自 toMarkdown 赢的场景，实验结果系统性偏向 toMarkdown，
+      // 无法回答「该不该换」。两版各截 200 字成本为零；toMarkdown 偏短时记 null 占位。
+      if (got && got.rewriter) {
+        abExp.push({
+          url: it.link,
+          toMarkdown: md ? md.slice(0, AB_EXP_HEAD) : null,
+          htmlRewriter: got.rewriter.slice(0, AB_EXP_HEAD),
+        });
       }
     } catch (e) { /* 静默：保留原摘要 */ }
   }
@@ -1760,6 +1770,8 @@ async function consumeDigest(batch, env) {
   };
   const msg = batch.messages[0];
   const { window, full = false } = msg.body || {};
+  const msgAt = msg.body && msg.body.at; // v4.0.2.4（外部审查 A3）：body 可能畸形为 null，
+  // 直接用 msg.body.at 会抛 TypeError；isStaleShard 对 !msgAt 本就返回 false，向后兼容。
   log(`开始 window=${window} full=${full}`);
 
   // 1. 等分片就绪（生产者绑定配了 90s deliveryDelay，通常首轮即就绪；
@@ -1777,8 +1789,8 @@ async function consumeDigest(batch, env) {
       const s = await net.kvGet(shardKey(window, n), 'json', `shard:${n}`).catch(() => null);
       // v4.0.2.1（ROADMAP B3）：分片存在但过期（上一班的）同样视为未就绪——
       // 误用旧分片会把旧闻当新闻播，宁可重试/进 DLQ（D2 告警兜底）
-      if (!s || !Array.isArray(s.items) || isStaleShard(s, msg.body.at)) {
-        if (s && isStaleShard(s, msg.body.at)) staleSeen = true;
+      if (!s || !Array.isArray(s.items) || isStaleShard(s, msgAt)) {
+        if (s && isStaleShard(s, msgAt)) staleSeen = true;
         ready = false; break;
       }
       attempt.push(s);
@@ -2217,8 +2229,11 @@ export default {
         : minute === SEND_MINUTE ? 'send' : 'unknown';
       try {
         // 心跳：cron 已触发。KV 写失败也记日志，不静默。
-        await net.kvPut(runKey(window, 'cron'), JSON.stringify({ at: Date.now(), cron: event.cron, minute, kind }),
-          { expirationTtl: RUN_TTL }, `run:cron`).catch(e => console.error(`[cron] 心跳写失败 ${window}: ${e && e.message}`));
+        // v4.0.2.4（外部审查 A2）：键带 kind——早班 window 内 fetch/digest/send 三个触发点
+        // 写各自独立键，避免「fetch 缺席但 digest/send 在场」时心跳键仍存 → 假阳性，
+        // 把 v4.0.2.3 自己要验证的「cron 没触发 vs 触发了但入队挂」再次糊住。
+        await net.kvPut(runKey(window, 'cron:' + kind), JSON.stringify({ at: Date.now(), cron: event.cron, minute, kind }),
+          { expirationTtl: RUN_TTL }, `run:cron`).catch(e => console.error(`[cron] 心跳写失败 ${window}/${kind}: ${e && e.message}`));
         if (kind === 'fetch') {
           // 只入队抓取；精选由 :50 的 cron 单独入队（10 分钟缓冲给抓取消费者）
           await enqueueFetch(env, net, window);
@@ -2235,12 +2250,12 @@ export default {
           return;
         }
         // 入队成功记录
-        await net.kvPut(runKey(window, 'enqueue'), JSON.stringify({ at: Date.now(), kind, budget: budget.report() }),
-          { expirationTtl: RUN_TTL }, `run:enqueue`).catch(e => console.error(`[cron] enqueue 记录写失败 ${window}: ${e && e.message}`));
+        await net.kvPut(runKey(window, 'enqueue:' + kind), JSON.stringify({ at: Date.now(), kind, budget: budget.report() }),
+          { expirationTtl: RUN_TTL }, `run:enqueue`).catch(e => console.error(`[cron] enqueue 记录写失败 ${window}/${kind}: ${e && e.message}`));
       } catch (e) {
         // 入队失败：写 durable 错误记录（不再是仅 console.error 后消失）
         console.error(`[cron] ${window} 入队失败：${e && e.message}`);
-        await net.kvPut(runKey(window, 'cron-error'), JSON.stringify({ at: Date.now(), kind, err: String(e && e.message || e).slice(0, ERR_RECORD_MAX) }),
+        await net.kvPut(runKey(window, 'cron-error:' + kind), JSON.stringify({ at: Date.now(), kind, err: String(e && e.message || e).slice(0, ERR_RECORD_MAX) }),
           { expirationTtl: RUN_TTL }, `run:cron-error`).catch(() => {});
       }
     })();
@@ -2276,6 +2291,11 @@ export default {
     // dry-run 探未知漂移）。每次跑一片（?shard=0..3，默认 0）：全量 4 片 = 39 源
     // 全覆盖，单片 ≤10 源 ≤10 子请求，不逼近 50 上限。
     if (url.pathname === '/api/fetch' && url.searchParams.get('dry') === '1') {
+      // v4.0.2.4（外部审查 B3）：与 /api/diag 同口径鉴权——dry-run 不泄露信息，但每次调用
+      // 发起 ≤10 个出站 fetch，未鉴权可被第三方随意消耗配额 + 给目标源制造噪音流量。
+      // 未配置 DIAG_KEY 时放行（与 diag 灰度语义一致）。
+      const auth = diagAuthorized(url.searchParams.get('key'), env);
+      if (!auth.ok) return json({ error: auth.err }, true, 403);
       const shard = Math.max(0, Math.min(SHARD_COUNT - 1, Number(url.searchParams.get('shard') || 0) || 0));
       const budget = createBudget();
       const net = createNet(env, budget);

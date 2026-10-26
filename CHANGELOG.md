@@ -224,6 +224,48 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
   100% 生效）并推送（main `847fe701`，byte 校验 0 差异）。下一早班（北京 2026-10-27 05:40）观察
   `run:2026-10-27-am:cron` 是否出现即可确认 cron 是否触发；若 cron 在但无 fetch 分片，则指向队列消费侧（guji-fetch）
 
+## v4.0.2.4 · 2026-10-26 下午 · 外部审查第七环修复（6 项全落地）
+
+> 来源：外部 AI 对 v4.0.1→v4.0.2.3（main @ cddfdca）的全文复审（Issue #2 评论，2026-10-26 13:25），
+> 首次要求「思考链写全」的审查（起疑→假设→验证→排除→结论）。6 项发现（A1-A3/B1-B3）逐条对代码
+> 核实后全部属实，全部修复；其 7 条排除项与背书清单照单收录（DEVLOG §4.7.8）。
+
+**修复（A1 · 唯一生产行为差异项）**
+- `parseDigest` 第三级容错正则 `/\{[^{}]*\}/g` → `/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g`（支持一层嵌套）。
+  **根因**：v4.0.2 rubric 输出契约引入嵌套 `scores:{...}`，旧正则遇内层 `{` 即断，max_tokens 截断
+  （无收尾 `]`）时只抽到 scores 碎片（JSON.parse 成功但无 idx）→ **全部跳过 → 0 条**，三级容错
+  退化成两级半。Node 实测复现：截断嵌套输出 → 提取 2 个对象、有效 idx 0 个。
+  112 项旧测试无一覆盖此路径（rubric 用例全走一级解析成功）——「测试全绿但没测到东西」的活标本
+
+**修复（A2 · 观测设计缺陷，赶在 10-27 早班验证前）**
+- scheduled 心跳/入队/错误三类记录键从 `run:{window}:cron` 加 kind 维度 → `run:{window}:cron:fetch`
+  / `:digest` / `:send`（enqueue、cron-error 同理）。旧键只到 window 粒度，早班三个触发点
+  （05:40/05:50/06:00）覆盖写同键，「fetch 缺席但 digest/send 在场」时心跳键仍在 → **假阳性**，
+  恰好糊住 v4.0.2.3 自己要验证的「cron 没触发 vs 触发了但入队挂」
+
+**修复（B1 · 实验设计缺陷，赶在当晚 pm 班采样前）**
+- `enrichMaterial` 的 B1 A/B 采集从「toMarkdown 长度大胜才采」改为「手里有两版就无条件采」。
+  旧写法样本 100% 来自 toMarkdown 赢的场景，人眼结论系统性偏向 toMarkdown，实验无法回答「该不该换」
+
+**修复（A3 / B2 / B3 · 低风险顺带）**
+- `consumeDigest`：`msg.body.at` → 预取 `msgAt = msg.body && msg.body.at`（body 畸形为 null 时不再
+  抛 TypeError 白烧 3 次重试；`isStaleShard` 对 `!msgAt` 本就返回 false，向后兼容）
+- `BUDGET_PLAN` 账实对齐：digest 19→20（P1-⑤ aiEmbed +1）、send.slice 29→33（末片 DLQ 告警
+  kvGet×2+send+kvPut）。仍远低于 50，纯自律一致性
+- `/api/fetch?dry=1` 加 `diagAuthorized` 鉴权（与 /api/diag 同口径：未配置 DIAG_KEY 放行）——
+  dry-run 不泄露信息但每次发起 ≤10 个出站 fetch，不该被第三方随意消耗
+
+**测试**
+- smoke 112 → 116 项：+A1 截断嵌套 rubric 第三级仍恢复完整条目 / +A2 早班三触发点各写独立键 /
+  +B1 toMarkdown 不比原 desc 长时仍采集
+- **顺带揪出一个「假绿」测试标本**：旧「Jina 路径不采集」用例从未真正测过 Jina——`createNet(env, budget)`
+  只收两个参数，`mkB1Net` 把 JINA_KEY 放第三参被静默忽略；它通过靠 ab1 先改写共享 `b1item.desc`
+  使「md 不再更长」碰巧不采集（状态污染 + 参数丢失双重假绿）。已修：env 合并进第一参 + 用例改独立克隆
+
+**验证 / 已部署**
+- 116 smoke + 39 e2e 全绿；已部署（CF 版本见下方推送记录）并推送。A2 使 10-27 早班验证键名变为
+  `run:2026-10-27-am:cron:fetch`（带 kind），观察指引同步更新
+
 ## v4.0 · 2026-10-25 · 队列化架构上线
 
 **架构**
