@@ -915,6 +915,34 @@ D2 的 DLQ 告警链路本轮**未触发也不可能触发**（没有死信消�
 - **固化一条新流程纪律**：今后凡在审查复核里写下「采纳 / 全盘采纳 / 认同」的项，
   必须同 commit 在 ROADMAP 标 `[x]` 完成或 `- [ ]` 明确排期，不允许停在「认同」无归属状态。
 
+#### 实现过程中遇到的技术问题（非代码逻辑 bug，属平台 / 测试坑）
+
+补 B1 时踩了三个不在「代码本身」层面的坑，按用户要求记全：
+
+1. **HTMLRewriter 是流式 transform，必须消费 body 才跑 handler**：
+   最初写 `const res = rw.transform(new Response(html, ...))` 后直接读 `text` 变量，
+   结果恒为空——`HTMLRewriter` 的 `.on('p,...',{text(){}})` handler 是流式触发，
+   **只有 `await res.text()` 把响应体消费完，handler 才会被调用并把文本累加进闭包变量**。
+   这与 `toMarkdown` 路径「`await aiToMarkdown` 拿到完整结果」的心智模型不同，是 Workers 运行时特有的流式语义。修复：在 `htmlRewriterText` 末尾补 `await res.text()`。
+
+2. **HTMLRewriter 是 Workers 专属 API，Node 没有原生实现**：
+   smoke 测试在 Node 跑，直接 `new HTMLRewriter()` 会 `ReferenceError`。
+   解决：测试里临时 `globalThis.HTMLRewriter = fake`，跑完 B1 用例后还原全局，
+   不影响其他用例。这是 `fetchViaToMarkdown` 同样面临的「Node 测不到 Workers API」限制，
+   也提醒我：凡是依赖 Workers 运行时 API 的新代码，测试都要走「注入 fake」路线，
+   不能假设 Node 有该全局对象。
+
+3. **测试样本 HTML 太短触发了生产守卫，初次调试一度以为 B1 没接线**：
+   `fetchViaToMarkdown` 有 `if (html.length < 200) throw` 守卫（真实网页都 >200 字，生产不会触发）；
+   我的测试样本只有 95 字符，被直接抛掉，`enrichMaterial` 返回空数组——看起来像「abExp 没产生」。
+   排查才定位是测试样本问题而非代码 bug，把样本加长到 >200 字后 B1 采集正常出现。
+   这条值得记：调试「新功能没生效」时，先确认是不是被某个生产守卫/前置校验拦了，
+   而不是先怀疑核心逻辑。
+
+4. **`enrichMaterial` 是内部函数，要测 B1 接线得先导出**：
+   返回值语义从 `material` 改成 `abExp` 后，smoke 想直接调它验证 A/B 采集，
+   需要先 `export function enrichMaterial`，否则测试拿不到函数引用。属「导出边界随职责变化」的小调整。
+
 ---
 
 ## 5. 横切反思：贯穿四版的方法论

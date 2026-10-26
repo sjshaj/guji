@@ -160,6 +160,28 @@ SimHash」**；该方向由 P1-⑤ 聚类在精选路径覆盖
 - smoke 100 → 105 项：B1 接线（toMarkdown 路径产生采集 / Jina 路径不进 / 两版截断 200 字）；
   HTMLRewriter 是 Workers 专属 API，Node 无原生实现，测试注入 fake 覆盖后还原全局
 
+**代码改动清单（函数级）**
+- 新增常量 `AB_EXP_HEAD = 200`（§1 config）：B1 A/B 两版 desc 各记前 200 字（仅 aiTrace，不落库）
+- `enrichMaterial`（§11 增强）：新增 `abExp` 数组收集对比数据；当 `got.rewriter` 存在（仅
+  toMarkdown 路径有同份 HTML）时，`abExp.push({ url, toMarkdown: 前200字, htmlRewriter: 前200字 })`；
+  函数返回值从 `material` **改为 `abExp`**（调用方 makeDigest 用返回值，不再依赖副作用）
+- 新增 `htmlRewriterText(html)` helper：用 `HTMLRewriter` 对整页 HTML 裸抽文本
+  （选择器覆盖 p/div/span/li/h1-6/a/td/th/article/section/blockquote——导航栏与
+  Cookie 声明会混入，这正是要度量的「噪音」），返回清洗并截断到 200 字的纯文本
+- `fetchViaToMarkdown`：抓完 HTML 后调 `htmlRewriterText` 得 `rewriter`，
+  返回形态从 `string` 改为 `{ md, rewriter }`
+- `fetchViaJina`：返回形态同步改为 `{ md, rewriter: null }`（Jina 路径无同份 HTML，不参与 A/B）
+- `makeDigest`：解构 `const abExp = await enrichMaterial(...)`，当 `abExp.length` 时
+  `trace.push({ stage: 'b1-ab', note, items: abExp })`——自然出现在 `/api/diag` 的 aiTrace 中
+
+**为什么这样改（设计约束）**
+- **零成本**：复用 `fetchViaToMarkdown` 已经抓到的整页 HTML（原本抓完就丢弃），
+  不再发额外请求——0 子请求、0 KV 写入、纯 CPU，不挤占 digest 班 19/50 预算
+- **不替换生产输出**：两版 desc 只进 `aiTrace` 供人眼比对，生产仍只用 toMarkdown 版，
+  避免用「未经验证的 HTMLRewriter 裸抽」直接替换已稳定的 enrich 结果（这正是 PR #1 的激进替换方案被否决的原因）
+- **只在 toMarkdown 路径采集**：Jina 路径手里没有「同份 HTML」（Jina 直接返回 markdown），
+  无法做对照，故 `rewriter: null` 主动不进采集，保证对照样本的可比性
+
 **验证**
 - 105 项测试全绿 → 部署版本 **1a09990f**（9fc50e2）→ `/api/diag` 200 / 页面 200 /
   items 149 / digest 9 / digestErr 空
