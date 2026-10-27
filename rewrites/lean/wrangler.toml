@@ -1,0 +1,63 @@
+name = "guji"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+# 继续复用现有 KV，不要新建 namespace。
+[[kv_namespaces]]
+binding = "GUJI_KV"
+id = "ca49d41ac8fa4987a0f818cee47237bf"
+
+[ai]
+binding = "AI"
+
+# 队列名称与 index.js 中常量一致。
+[[queues.producers]]
+binding = "GUJI_FETCH_Q"
+queue = "guji-fetch"
+
+[[queues.producers]]
+binding = "GUJI_DIGEST_Q"
+queue = "guji-digest"
+
+[[queues.producers]]
+binding = "GUJI_SEND_Q"
+queue = "guji-send"
+
+[[queues.consumers]]
+queue = "guji-fetch"
+max_batch_size = 1
+max_concurrency = 4
+max_retries = 4
+retry_delay = 20
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-digest"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 12
+retry_delay = 60
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-send"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 12
+retry_delay = 30
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-dlq"
+max_batch_size = 10
+max_concurrency = 1
+
+# Cloudflare Cron 使用 UTC：
+# 21:40/21:50/22:00 UTC = 北京次日 05:40/05:50/06:00
+# 13:40/13:50/14:00 UTC = 北京当日 21:40/21:50/22:00
+[triggers]
+crons = ["40,50 21 * * *", "0 22 * * *", "40,50 13 * * *", "0 14 * * *"]
+
+# 部署前请在 Cloudflare Dashboard 或 Wrangler 中配置 secrets：
+# TG_BOT_TOKEN, TG_CHAT_ID, TG_CHANNEL（如使用频道）, DIAG_KEY
+# 可选：ZHIPU_KEY（使用智谱 GLM），SEC_USER_AGENT（建议用真实联系邮箱）

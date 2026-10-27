@@ -1,0 +1,12 @@
+{
+  "name": "guji-lean",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check index.js && node --check smoke-test.mjs",
+    "test": "node smoke-test.mjs"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.11.2"
+  }
+}
