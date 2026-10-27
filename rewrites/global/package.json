@@ -1,0 +1,8 @@
+{
+  "name": "guji-global-rewrite",
+  "private": true,
+  "type": "module",
+  "scripts": {"check": "node --check index.js", "test": "node smoke-test.mjs"},
+  "dependencies": {"fast-xml-parser": "^5.11.2"},
+  "devDependencies": {"wrangler": "^4.45.0"}
+}

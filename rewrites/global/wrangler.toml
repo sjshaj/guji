@@ -1,0 +1,64 @@
+name = "guji"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+# Reuse the existing production KV. Do not create a replacement namespace.
+[[kv_namespaces]]
+binding = "GUJI_KV"
+id = "ca49d41ac8fa4987a0f818cee47237bf"
+
+[ai]
+binding = "AI"
+
+# Existing production queues: keep names and bindings unchanged.
+[[queues.producers]]
+binding = "GUJI_FETCH_Q"
+queue = "guji-fetch"
+
+[[queues.producers]]
+binding = "GUJI_DIGEST_Q"
+queue = "guji-digest"
+
+[[queues.producers]]
+binding = "GUJI_SEND_Q"
+queue = "guji-send"
+
+[[queues.producers]]
+binding = "GUJI_RETRY_Q"
+queue = "guji-retry"
+
+[[queues.consumers]]
+queue = "guji-fetch"
+max_batch_size = 1
+max_concurrency = 4
+max_retries = 3
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-digest"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 10
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-send"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 3
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-retry"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 3
+dead_letter_queue = "guji-dlq"
+
+[[queues.consumers]]
+queue = "guji-dlq"
+max_batch_size = 10
+
+# One account-level Cron Trigger only. Worker logic handles the six daily stage times.
+[triggers]
+crons = ["* * * * *"]
